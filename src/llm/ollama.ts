@@ -1,31 +1,51 @@
+import * as vscode from 'vscode';
+
 export interface OllamaMessage {
     role: 'system' | 'user' | 'assistant';
     content: string;
 }
 
 export interface OllamaOptions {
-    model: string;
+    model?: string;
     temperature?: number;
     num_ctx?: number;
 }
 
+const MODEL_LIST_TIMEOUT_MS = 1500;
+
 export class OllamaClient {
-    private baseUrl = 'http://localhost:11434/api';
+    private get baseUrl(): string {
+        const configured = vscode.workspace
+            .getConfiguration('aether')
+            .get<string>('ollamaBaseUrl', 'http://localhost:11434');
+
+        return `${configured.replace(/\/$/, '')}/api`;
+    }
+
+    private get defaultModel(): string | undefined {
+        return vscode.workspace.getConfiguration('aether').get<string>('defaultModel');
+    }
 
     /**
      * Lists available models on the local Ollama instance
      */
     async listModels(): Promise<string[]> {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), MODEL_LIST_TIMEOUT_MS);
         try {
-            const response = await fetch(`${this.baseUrl}/tags`);
+            const response = await fetch(`${this.baseUrl}/tags`, { signal: controller.signal });
             if (!response.ok) {
                 throw new Error(`Failed to list models: ${response.statusText}`);
             }
             const data = await response.json() as { models: Array<{ name: string }> };
-            return data.models.map(m => m.name);
+            return data.models
+                .map(m => m.name)
+                .sort((a, b) => a.localeCompare(b));
         } catch (error) {
             console.error('Ollama Client Error (listModels):', error);
             return [];
+        } finally {
+            clearTimeout(timeout);
         }
     }
 
@@ -34,14 +54,18 @@ export class OllamaClient {
      */
     async *chatStream(messages: OllamaMessage[], options: OllamaOptions): AsyncGenerator<string> {
         const payload = {
-            model: options.model,
+            model: options.model || this.defaultModel,
             messages,
             stream: true,
             options: {
-                temperature: options.temperature ?? 0.7,
-                num_ctx: options.num_ctx ?? 4096
+                temperature: options.temperature ?? this.getTemperature(0.7),
+                num_ctx: options.num_ctx ?? this.getContextWindow()
             }
         };
+
+        if (!payload.model) {
+            throw new Error('No Ollama model selected. Pull a local model, for example `ollama pull llama3.2`, then refresh Aether.');
+        }
 
         const response = await fetch(`${this.baseUrl}/chat`, {
             method: 'POST',
@@ -106,14 +130,18 @@ export class OllamaClient {
      */
     async generate(prompt: string, options: OllamaOptions): Promise<string> {
         const payload = {
-            model: options.model,
+            model: options.model || this.defaultModel,
             prompt,
             stream: false,
             options: {
-                temperature: options.temperature ?? 0.2,
-                num_ctx: options.num_ctx ?? 4096
+                temperature: options.temperature ?? this.getTemperature(0.2),
+                num_ctx: options.num_ctx ?? this.getContextWindow()
             }
         };
+
+        if (!payload.model) {
+            throw new Error('No Ollama model selected. Pull a local model, for example `ollama pull llama3.2`, then refresh Aether.');
+        }
 
         const response = await fetch(`${this.baseUrl}/generate`, {
             method: 'POST',
@@ -145,5 +173,13 @@ export class OllamaClient {
 
         const data = await response.json() as { embedding: number[] };
         return data.embedding;
+    }
+
+    private getTemperature(fallback: number): number {
+        return vscode.workspace.getConfiguration('aether').get<number>('temperature', fallback);
+    }
+
+    private getContextWindow(): number {
+        return vscode.workspace.getConfiguration('aether').get<number>('contextWindow', 8192);
     }
 }

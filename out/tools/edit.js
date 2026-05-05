@@ -36,27 +36,54 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.showDiff = showDiff;
 exports.applyEdit = applyEdit;
 const vscode = __importStar(require("vscode"));
+const file_1 = require("./file");
 async function showDiff(original, updated, filePath) {
-    const left = vscode.Uri.parse(`untitled:${filePath}-old`);
-    const right = vscode.Uri.parse(`untitled:${filePath}-new`);
-    await vscode.workspace.openTextDocument(left).then(doc => {
-        const edit = new vscode.WorkspaceEdit();
-        edit.insert(left, new vscode.Position(0, 0), original);
-        return vscode.workspace.applyEdit(edit);
+    const leftDoc = await vscode.workspace.openTextDocument({
+        content: original,
+        language: inferLanguage(filePath)
     });
-    await vscode.workspace.openTextDocument(right).then(doc => {
-        const edit = new vscode.WorkspaceEdit();
-        edit.insert(right, new vscode.Position(0, 0), updated);
-        return vscode.workspace.applyEdit(edit);
+    const rightDoc = await vscode.workspace.openTextDocument({
+        content: updated,
+        language: inferLanguage(filePath)
     });
-    await vscode.commands.executeCommand('vscode.diff', left, right, 'Aether Preview Changes');
+    const fileName = filePath.split(/[/\\]/).pop() || filePath;
+    await vscode.commands.executeCommand('vscode.diff', leftDoc.uri, rightDoc.uri, `Aether: Changes Preview (${fileName})`);
 }
 async function applyEdit(filePath, newContent) {
+    if (!(await (0, file_1.fileExists)(filePath))) {
+        const message = `Cannot edit missing file: ${filePath}`;
+        vscode.window.showErrorMessage(message);
+        return { ok: false, message };
+    }
     const uri = vscode.Uri.file(filePath);
-    const edit = new vscode.WorkspaceEdit();
-    // Replace the entire file with new content
-    edit.replace(uri, new vscode.Range(0, 0, Number.MAX_VALUE, Number.MAX_VALUE), newContent);
-    await vscode.workspace.applyEdit(edit);
-    vscode.window.showInformationMessage("Changes applied");
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(newContent));
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document, { preview: false });
+    const message = `Changes applied: ${filePath}`;
+    vscode.window.showInformationMessage(message);
+    return { ok: true, message };
+}
+function inferLanguage(filePath) {
+    const extension = filePath.split('.').pop()?.toLowerCase();
+    switch (extension) {
+        case 'ts':
+            return 'typescript';
+        case 'tsx':
+            return 'typescriptreact';
+        case 'js':
+            return 'javascript';
+        case 'jsx':
+            return 'javascriptreact';
+        case 'json':
+            return 'json';
+        case 'md':
+            return 'markdown';
+        case 'css':
+            return 'css';
+        case 'html':
+            return 'html';
+        default:
+            return 'plaintext';
+    }
 }
 //# sourceMappingURL=edit.js.map

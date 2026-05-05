@@ -1,8 +1,8 @@
 {
   "name": "aether",
   "displayName": "Aether",
-  "description": "Local-first coding assistant extension powered by Ollama",
-  "version": "0.1.0",
+  "description": "AI coding assistant powered by NVIDIA NIM models",
+  "version": "0.2.0",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -20,6 +20,10 @@
       {
         "command": "aether.startChat",
         "title": "Aether: Start Chat"
+      },
+      {
+        "command": "aether.newTask",
+        "title": "Aether: New Task"
       },
       {
         "command": "aether.inlineChat",
@@ -43,31 +47,97 @@
           "name": "Chat"
         }
       ]
+    },
+    "configuration": {
+      "title": "Aether",
+      "properties": {
+        "aether.nvidiaApiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Your **NVIDIA NIM API key**. Get one at [build.nvidia.com](https://build.nvidia.com). Stored in VS Code settings — consider using a [Settings Sync secret](https://code.visualstudio.com/docs/editor/settings-sync) for security."
+        },
+        "aether.nvidiaModel": {
+          "type": "string",
+          "default": "z-ai/glm-5.1",
+          "enum": [
+            "z-ai/glm-5.1",
+            "deepseek-ai/deepseek-r1",
+            "deepseek-ai/deepseek-v3",
+            "meta/llama-3.3-70b-instruct",
+            "meta/llama-3.1-405b-instruct",
+            "mistralai/mistral-large-2-instruct",
+            "mistralai/mixtral-8x22b-instruct-v0.1",
+            "nvidia/llama-3.1-nemotron-70b-instruct",
+            "google/gemma-3-27b-it",
+            "microsoft/phi-3-medium-128k-instruct",
+            "qwen/qwen2.5-coder-32b-instruct"
+          ],
+          "enumDescriptions": [
+            "Z-AI GLM 5.1 — thinking model with reasoning tokens (ZML)",
+            "DeepSeek R1 — open-source reasoning/CoT model",
+            "DeepSeek V3 — fast general-purpose model",
+            "Llama 3.3 70B Instruct — Meta's latest instruction-tuned model",
+            "Llama 3.1 405B Instruct — Meta's largest open model",
+            "Mistral Large 2 — Mistral's flagship model",
+            "Mixtral 8x22B — Mistral MoE model",
+            "Nemotron 70B — NVIDIA fine-tuned Llama for coding",
+            "Gemma 3 27B — Google's open model",
+            "Phi-3 Medium 128K — Microsoft's small-but-capable model",
+            "Qwen 2.5 Coder 32B — Alibaba's coding-specialized model"
+          ],
+          "description": "Default NVIDIA NIM model. Can be overridden per-session in the chat toolbar."
+        },
+        "aether.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL for the local Ollama server used to discover and run local models."
+        },
+        "aether.defaultModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional default local Ollama model name, such as llama3.2 or codellama:latest. Leave blank to use the first discovered local model when no NVIDIA API key is configured."
+        },
+        "aether.contextWindow": {
+          "type": "number",
+          "default": 8192,
+          "minimum": 1024,
+          "description": "Context window passed to local Ollama chat requests."
+        },
+        "aether.temperature": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature for chat responses."
+        }
+      }
     }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
+    "package": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test": "node ./test/runTest.js",
+    "test": "npm run test-compile",
     "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
     "test-compile": "tsc -p ./"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
     "@types/mocha": "^10.0.6",
     "@types/node": "18.x",
+    "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^6.15.0",
     "@typescript-eslint/parser": "^6.15.0",
+    "esbuild": "^0.19.10",
     "eslint": "^8.56.0",
-    "typescript": "^5.3.3",
-    "esbuild": "^0.19.10"
+    "typescript": "^5.3.3"
   },
   "dependencies": {
-    "@vscode/webview-ui-toolkit": "^1.2.2"
+    "@vscode/webview-ui-toolkit": "^1.2.2",
+    "openai": "^6.36.0"
   }
 }

@@ -35,30 +35,46 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createFile = createFile;
 exports.readFile = readFile;
+exports.fileExists = fileExists;
+exports.resolveSafeFilePath = resolveSafeFilePath;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
+const workspace_1 = require("./workspace");
 async function createFile(filePath, content) {
     const uri = vscode.Uri.file(filePath);
-    // Check if file already exists
     try {
         await vscode.workspace.fs.stat(uri);
-        vscode.window.showErrorMessage(`File already exists: ${filePath}`);
-        return;
+        const message = `File already exists: ${filePath}`;
+        vscode.window.showErrorMessage(message);
+        return { ok: false, message };
     }
     catch {
         // File does not exist, safe to create
     }
+    const directory = vscode.Uri.file(path.dirname(filePath));
+    await vscode.workspace.fs.createDirectory(directory);
     const encoder = new TextEncoder();
     await vscode.workspace.fs.writeFile(uri, encoder.encode(content));
-    vscode.window.showInformationMessage(`File created: ${filePath}`);
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document, { preview: false });
+    const message = `File created: ${filePath}`;
+    vscode.window.showInformationMessage(message);
+    return { ok: true, message };
 }
 async function readFile(filePath) {
+    const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(filePath));
+    return new TextDecoder().decode(bytes);
+}
+async function fileExists(filePath) {
     try {
-        const uri = vscode.Uri.file(filePath);
-        const uint8Array = await vscode.workspace.fs.readFile(uri);
-        return new TextDecoder().decode(uint8Array);
+        await vscode.workspace.fs.stat(vscode.Uri.file(filePath));
+        return true;
     }
     catch {
-        return '';
+        return false;
     }
+}
+function resolveSafeFilePath(file) {
+    return (0, workspace_1.resolveWorkspacePath)(file.replace(/^[/\\]+/, ''));
 }
 //# sourceMappingURL=file.js.map

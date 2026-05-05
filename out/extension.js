@@ -40,11 +40,15 @@ const chatView_1 = require("./ui/chatView");
 function activate(context) {
     console.log('Aether is now active!');
     // Register Webview Provider for the Sidebar Chat
-    const chatViewProvider = new chatView_1.ChatViewProvider(context.extensionUri);
+    const chatViewProvider = new chatView_1.ChatViewProvider(context.extensionUri, context);
     context.subscriptions.push(vscode.window.registerWebviewViewProvider('aetherChatView', chatViewProvider));
     // Command: Start Chat
     const startChatCommand = vscode.commands.registerCommand('aether.startChat', () => {
         vscode.commands.executeCommand('aetherChatView.focus');
+    });
+    const newTaskCommand = vscode.commands.registerCommand('aether.newTask', async () => {
+        await chatViewProvider.clearHistory();
+        await vscode.commands.executeCommand('aetherChatView.focus');
     });
     // Command: Inline Chat
     const inlineChatCommand = vscode.commands.registerCommand('aether.inlineChat', async () => {
@@ -59,12 +63,11 @@ function activate(context) {
             placeHolder: 'e.g. Explain this function, Refactor to use async/await'
         });
         if (query) {
-            // Forward to chat view or handle inline diff UI
-            vscode.window.showInformationMessage(`Aether inline chat triggered with: ${query}`);
-            // TODO: Implement inline edit flow with diff preview
+            await vscode.commands.executeCommand('aetherChatView.focus');
+            await chatViewProvider.submitInlineRequest(query, selection || editor.document.getText(), vscode.workspace.asRelativePath(editor.document.uri));
         }
     });
-    context.subscriptions.push(startChatCommand, inlineChatCommand);
+    context.subscriptions.push(startChatCommand, newTaskCommand, inlineChatCommand);
 }
 function deactivate() { }
 //# sourceMappingURL=extension.js.map

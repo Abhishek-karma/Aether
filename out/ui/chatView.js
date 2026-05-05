@@ -35,35 +35,27 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ChatViewProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const actions_1 = require("../agent/actions");
 const prompt_1 = require("../agent/prompt");
-const nvidia_1 = require("../llm/nvidia");
-const ollama_1 = require("../llm/ollama");
+const modelRouter_1 = require("../llm/modelRouter");
 const edit_1 = require("../tools/edit");
 const file_1 = require("../tools/file");
 const terminal_1 = require("../tools/terminal");
 const workspace_1 = require("../tools/workspace");
 const HISTORY_KEY = 'aether.chatHistory';
 const MAX_STORED_MESSAGES = 100;
-const MODEL_CACHE_MS = 10000;
-const NVIDIA_MODEL_PREFIX = 'nvidia::';
-const OLLAMA_MODEL_PREFIX = 'ollama::';
-const NVIDIA_MODEL_IDS = new Set(nvidia_1.AVAILABLE_MODELS.map(model => model.id));
 class ChatViewProvider {
     _extensionUri;
     extensionContext;
     _view;
-    nvidiaClient;
-    ollamaClient;
+    modelRouter;
     messages = [];
     lastModel;
     actionCounter = 0;
-    modelCache;
-    modelLoad;
     constructor(_extensionUri, extensionContext) {
         this._extensionUri = _extensionUri;
         this.extensionContext = extensionContext;
-        this.nvidiaClient = new nvidia_1.NvidiaClient();
-        this.ollamaClient = new ollama_1.OllamaClient();
+        this.modelRouter = new modelRouter_1.ModelRouter();
         this.messages = this.loadHistory();
     }
     async resolveWebviewView(webviewView, _context, _token) {
@@ -87,7 +79,7 @@ class ChatViewProvider {
                     this.postHistory();
                     break;
                 case 'getModels': {
-                    const { models, defaultModel } = await this.listAvailableModels();
+                    const { models, defaultModel } = await this.modelRouter.listModels();
                     this._view?.webview.postMessage({ type: 'modelsLoaded', models, defaultModel });
                     break;
                 }
@@ -145,7 +137,7 @@ If an edit is needed, return the full updated content for ${fileName}.`;
         this._view.webview.postMessage({ type: 'startStream' });
         try {
             let fullResponse = '';
-            const selectedModel = this.resolveModel(model);
+            const selectedModel = await this.modelRouter.resolve(model);
             this.lastModel = selectedModel.value;
             const workspaceContext = await (0, workspace_1.collectWorkspaceContext)(contextHint);
             const requestMessages = [
@@ -155,9 +147,7 @@ If an edit is needed, return the full updated content for ${fileName}.`;
                 },
                 ...this.messages.slice(-12)
             ];
-            const stream = selectedModel.provider === 'ollama'
-                ? this.ollamaClient.chatStream(requestMessages, { model: selectedModel.model })
-                : this.nvidiaClient.chatStream(requestMessages, { model: selectedModel.model });
+            const stream = this.modelRouter.chatStream(requestMessages, selectedModel);
             for await (const chunk of stream) {
                 fullResponse += chunk;
                 this._view.webview.postMessage({ type: 'streamChunk', chunk });
@@ -166,7 +156,7 @@ If an edit is needed, return the full updated content for ${fileName}.`;
             await this.saveHistory();
             this._view.webview.postMessage({ type: 'endStream' });
             const actionCount = await this.processAgentActions(fullResponse, contextHint);
-            if (actionCount === 0 && this.shouldRequireFileActions(contextHint) && !isCorrectionRetry) {
+            if (actionCount === 0 && (0, actions_1.shouldRequireFileActions)(contextHint) && !isCorrectionRetry) {
                 await this.retryAsAgentAction(contextHint, selectedModel.value);
             }
         }
@@ -201,69 +191,6 @@ If an edit is needed, return the full updated content for ${fileName}.`;
             messages: this.messages
         });
     }
-    async listAvailableModels() {
-        const now = Date.now();
-        if (this.modelCache && this.modelCache.expiresAt > now) {
-            return this.modelCache;
-        }
-        if (!this.modelLoad) {
-            this.modelLoad = this.loadAvailableModels().finally(() => {
-                this.modelLoad = undefined;
-            });
-        }
-        return this.modelLoad;
-    }
-    async loadAvailableModels() {
-        const nvidiaModels = this.nvidiaClient.listModels().map(model => ({
-            id: `${NVIDIA_MODEL_PREFIX}${model.id}`,
-            label: model.label,
-            provider: 'nvidia'
-        }));
-        const localModelNames = await this.ollamaClient.listModels();
-        const localModels = localModelNames.map(name => ({
-            id: `${OLLAMA_MODEL_PREFIX}${name}`,
-            label: `Local Llama/Ollama: ${name}`,
-            provider: 'ollama'
-        }));
-        const models = [...localModels, ...nvidiaModels];
-        const defaultModel = this.getDefaultModelValue(localModelNames);
-        this.modelCache = {
-            expiresAt: Date.now() + MODEL_CACHE_MS,
-            models,
-            defaultModel
-        };
-        return this.modelCache;
-    }
-    getDefaultModelValue(localModels) {
-        const configuredLocal = vscode.workspace.getConfiguration('aether').get('defaultModel', '').trim();
-        if (configuredLocal && localModels.includes(configuredLocal)) {
-            return `${OLLAMA_MODEL_PREFIX}${configuredLocal}`;
-        }
-        const nvidiaApiKey = vscode.workspace.getConfiguration('aether').get('nvidiaApiKey', '').trim();
-        if (!nvidiaApiKey && localModels.length > 0) {
-            return `${OLLAMA_MODEL_PREFIX}${localModels[0]}`;
-        }
-        return `${NVIDIA_MODEL_PREFIX}${this.nvidiaClient.getDefaultModel()}`;
-    }
-    resolveModel(model) {
-        if (model?.startsWith(OLLAMA_MODEL_PREFIX)) {
-            const modelName = model.slice(OLLAMA_MODEL_PREFIX.length);
-            if (modelName) {
-                return { provider: 'ollama', model: modelName, value: model };
-            }
-        }
-        if (model?.startsWith(NVIDIA_MODEL_PREFIX)) {
-            const modelName = model.slice(NVIDIA_MODEL_PREFIX.length);
-            if (NVIDIA_MODEL_IDS.has(modelName)) {
-                return { provider: 'nvidia', model: modelName, value: model };
-            }
-        }
-        if (model && NVIDIA_MODEL_IDS.has(model)) {
-            return { provider: 'nvidia', model, value: `${NVIDIA_MODEL_PREFIX}${model}` };
-        }
-        const fallback = this.nvidiaClient.getDefaultModel();
-        return { provider: 'nvidia', model: fallback, value: `${NVIDIA_MODEL_PREFIX}${fallback}` };
-    }
     async retryAsAgentAction(originalRequest, model) {
         const correction = `Your previous response did not contain any Aether tool actions. This is an implementation task, so do not explain or give instructions. Produce the next required create/edit/read_file/run_command action now for this user request:\n\n${originalRequest}`;
         const actionId = this.nextActionId();
@@ -286,9 +213,9 @@ If an edit is needed, return the full updated content for ${fileName}.`;
     }
     async processAgentActions(response, contextHint) {
         try {
-            const actions = this.extractActions(response);
+            const actions = (0, actions_1.extractActions)(response);
             if (actions.length === 0) {
-                const fallback = this.createActiveEditorFallbackAction(response, contextHint);
+                const fallback = (0, actions_1.createActiveEditorFallbackAction)(response, contextHint);
                 if (fallback) {
                     actions.push(fallback);
                 }
@@ -417,172 +344,6 @@ If an edit is needed, return the full updated content for ${fileName}.`;
             output: `exit code: ${result.exitCode}\n\n${output}`
         });
         await this.continueAfterToolResult(`Command: ${command}\nExit code: ${result.exitCode}\n${output}`, model);
-    }
-    extractActions(response) {
-        const actions = [
-            ...this.extractFencedFileActions(response),
-            ...this.extractMarkdownFileActions(response)
-        ];
-        for (const candidate of this.extractJsonCandidates(response)) {
-            try {
-                const parsed = JSON.parse(candidate);
-                const parsedActions = Array.isArray(parsed.actions) ? parsed.actions : [parsed];
-                for (const action of parsedActions) {
-                    if ((action.type === 'create' || action.type === 'edit') &&
-                        typeof action.file === 'string' &&
-                        typeof action.content === 'string') {
-                        actions.push(action);
-                    }
-                    else if (action.type === 'read_file' &&
-                        typeof action.file === 'string') {
-                        actions.push(action);
-                    }
-                    else if (action.type === 'run_command' &&
-                        typeof action.command === 'string') {
-                        actions.push(action);
-                    }
-                }
-            }
-            catch {
-                // Ignore prose or malformed JSON fragments.
-            }
-        }
-        return actions;
-    }
-    shouldRequireFileActions(request) {
-        return /\b(create|build|implement|add|fix|write|update|modify|change|refactor|delete|remove|make)\b/i.test(request);
-    }
-    createActiveEditorFallbackAction(response, request) {
-        if (!this.shouldRequireFileActions(request)) {
-            return undefined;
-        }
-        const editor = vscode.window.activeTextEditor;
-        if (!editor || editor.document.isUntitled) {
-            return undefined;
-        }
-        const code = this.extractFirstPlainCodeBlock(response);
-        if (!code) {
-            return undefined;
-        }
-        const document = editor.document;
-        const relativeFile = vscode.workspace.asRelativePath(document.uri);
-        const original = document.getText();
-        const selection = editor.selection;
-        const content = selection.isEmpty
-            ? this.insertAtPosition(original, document.offsetAt(selection.active), code)
-            : this.replaceRange(original, document.offsetAt(selection.start), document.offsetAt(selection.end), code);
-        return {
-            type: 'edit',
-            file: relativeFile,
-            content
-        };
-    }
-    extractFirstPlainCodeBlock(response) {
-        const blocks = response.matchAll(/```(?!aether-|json)(?:[A-Za-z0-9_-]+)?\n([\s\S]*?)```/g);
-        for (const block of blocks) {
-            const content = block[1].replace(/\s+$/, '');
-            if (content.length > 0 && !content.trim().startsWith('{')) {
-                return content;
-            }
-        }
-        return undefined;
-    }
-    replaceRange(original, start, end, replacement) {
-        return `${original.slice(0, start)}${replacement}${original.slice(end)}`;
-    }
-    insertAtPosition(original, offset, insertion) {
-        const prefix = original.slice(0, offset);
-        const suffix = original.slice(offset);
-        const before = prefix.endsWith('\n') || prefix.length === 0 ? '' : '\n';
-        const after = suffix.startsWith('\n') || suffix.length === 0 ? '' : '\n';
-        return `${prefix}${before}${insertion}${after}${suffix}`;
-    }
-    extractFencedFileActions(response) {
-        const actions = [];
-        const blocks = response.matchAll(/```aether-(create|edit)\s+(?:path|file)=([^\n]+)\n([\s\S]*?)```/g);
-        for (const block of blocks) {
-            const type = block[1];
-            const file = block[2].trim().replace(/^["']|["']$/g, '');
-            const content = block[3].replace(/\s+$/, '');
-            if (file && content.length > 0) {
-                actions.push({ type, file, content });
-            }
-        }
-        return actions;
-    }
-    extractMarkdownFileActions(response) {
-        const actions = [];
-        const blocks = response.matchAll(/(?:^|\n)(?:#{1,4}\s*)?(?:(File|Create|Edit):)?\s*`?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)`?\s*:?\s*\n```[A-Za-z0-9_-]*\n([\s\S]*?)```/g);
-        for (const block of blocks) {
-            const mode = block[1]?.toLowerCase();
-            const file = block[2].trim().replace(/\\/g, '/');
-            const content = block[3].replace(/\s+$/, '');
-            if (!this.looksLikeProjectFile(file) || content.length === 0) {
-                continue;
-            }
-            actions.push({
-                type: mode === 'edit' ? 'edit' : 'create',
-                file,
-                content
-            });
-        }
-        return actions;
-    }
-    looksLikeProjectFile(file) {
-        if (file.startsWith('.') || file.includes('..') || file.includes('://')) {
-            return false;
-        }
-        return /^[A-Za-z0-9_./-]+\.[A-Za-z0-9]+$/.test(file);
-    }
-    extractJsonCandidates(response) {
-        const candidates = [];
-        const fencedBlocks = response.matchAll(/```(?:json)?\s*([\s\S]*?)```/g);
-        for (const match of fencedBlocks) {
-            candidates.push(match[1].trim());
-        }
-        candidates.push(...this.extractBalancedJsonObjects(response));
-        return candidates;
-    }
-    extractBalancedJsonObjects(text) {
-        const objects = [];
-        let start = -1;
-        let depth = 0;
-        let inString = false;
-        let escaped = false;
-        for (let index = 0; index < text.length; index += 1) {
-            const char = text[index];
-            if (inString) {
-                if (escaped) {
-                    escaped = false;
-                }
-                else if (char === '\\') {
-                    escaped = true;
-                }
-                else if (char === '"') {
-                    inString = false;
-                }
-                continue;
-            }
-            if (char === '"') {
-                inString = true;
-                continue;
-            }
-            if (char === '{') {
-                if (depth === 0) {
-                    start = index;
-                }
-                depth += 1;
-                continue;
-            }
-            if (char === '}') {
-                depth -= 1;
-                if (depth === 0 && start !== -1) {
-                    objects.push(text.slice(start, index + 1));
-                    start = -1;
-                }
-            }
-        }
-        return objects;
     }
     nextActionId() {
         this.actionCounter += 1;

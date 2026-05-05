@@ -40,9 +40,9 @@ exports.NvidiaClient = exports.AVAILABLE_MODELS = exports.NVIDIA_BASE_URL = void
 const openai_1 = __importDefault(require("openai"));
 const vscode = __importStar(require("vscode"));
 exports.NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1';
-/** Full list of models available in the NVIDIA NIM catalogue. */
+/** Supported NVIDIA NIM models. Only the configured model is shown in the chat selector. */
 exports.AVAILABLE_MODELS = [
-    { id: 'z-ai/glm-5.1', label: 'GLM 5.1 (ZML ✦ thinking)', supportsThinking: true },
+    { id: 'z-ai/glm-5.1', label: 'GLM 5.1 (ZML thinking)', supportsThinking: true },
     { id: 'deepseek-ai/deepseek-r1', label: 'DeepSeek R1 (reasoning)', supportsThinking: true },
     { id: 'deepseek-ai/deepseek-v3', label: 'DeepSeek V3', supportsThinking: false },
     { id: 'meta/llama-3.3-70b-instruct', label: 'Llama 3.3 70B Instruct', supportsThinking: false },
@@ -62,13 +62,13 @@ class NvidiaClient {
     client;
     clientApiKey;
     /**
-     * Builds a fresh OpenAI client using the currently configured API key.
-     * Called per-request so key changes take effect without reloading.
+     * Reuses the OpenAI client until the configured API key changes.
+     * This keeps settings hot-reload behavior without rebuilding the client every request.
      */
     getClient() {
         const apiKey = cfg('nvidiaApiKey', '').trim();
         if (!apiKey) {
-            throw new Error('NVIDIA API key is not set. Open **Settings → Aether → Nvidia Api Key** and paste your key from build.nvidia.com.');
+            throw new Error('NVIDIA API key is not set. Open Settings > Aether > Nvidia Api Key and paste your key from build.nvidia.com.');
         }
         if (!this.client || this.clientApiKey !== apiKey) {
             this.client = new openai_1.default({ apiKey, baseURL: exports.NVIDIA_BASE_URL });
@@ -76,22 +76,15 @@ class NvidiaClient {
         }
         return this.client;
     }
-    /** Active model from VS Code settings (can be overridden per-session via the UI). */
     getDefaultModel() {
         return cfg('nvidiaModel', exports.AVAILABLE_MODELS[0].id);
     }
-    /** Returns the model catalogue for the UI dropdown. */
     listModels() {
         return exports.AVAILABLE_MODELS;
     }
-    /** Whether the given model emits reasoning_content tokens. */
     modelSupportsThinking(modelId) {
         return AVAILABLE_MODELS_BY_ID.get(modelId)?.supportsThinking ?? false;
     }
-    /**
-     * Streaming chat against the NVIDIA NIM endpoint.
-     * Yields text chunks; reasoning tokens are wrapped in <think>…</think>.
-     */
     async *chatStream(messages, options = {}) {
         const client = this.getClient();
         const model = options.model ?? this.getDefaultModel();
@@ -116,9 +109,6 @@ class NvidiaClient {
             }
         }
     }
-    /**
-     * Non-streaming single-turn generation (tool results, background tasks).
-     */
     async generate(prompt, options = {}) {
         const client = this.getClient();
         const model = options.model ?? this.getDefaultModel();

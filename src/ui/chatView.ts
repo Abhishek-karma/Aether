@@ -1,44 +1,36 @@
 import * as vscode from 'vscode';
+import {
+    CommandAction,
+    FileAction,
+    ReadFileAction,
+    createActiveEditorFallbackAction,
+    extractActions,
+    shouldRequireFileActions
+} from '../agent/actions';
 import { generateSystemPrompt } from '../agent/prompt';
-import { NvidiaClient, AVAILABLE_MODELS } from '../llm/nvidia';
-import { OllamaClient } from '../llm/ollama';
+import { ModelRouter } from '../llm/modelRouter';
 import { applyEdit, showDiff } from '../tools/edit';
 import { createFile, fileExists, readFile, resolveSafeFilePath } from '../tools/file';
 import { runCommand } from '../tools/terminal';
 import { collectWorkspaceContext } from '../tools/workspace';
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
-type FileAction = { type: 'create' | 'edit'; file: string; content: string };
-type ReadFileAction = { type: 'read_file'; file: string };
-type CommandAction = { type: 'run_command'; command: string; reason?: string };
-type AgentAction = FileAction | ReadFileAction | CommandAction;
-type ModelProvider = 'nvidia' | 'ollama';
-type SelectedModel = { provider: ModelProvider; model: string; value: string };
-type ModelOption = { id: string; label: string; provider: ModelProvider };
 
 const HISTORY_KEY = 'aether.chatHistory';
 const MAX_STORED_MESSAGES = 100;
-const MODEL_CACHE_MS = 10000;
-const NVIDIA_MODEL_PREFIX = 'nvidia::';
-const OLLAMA_MODEL_PREFIX = 'ollama::';
-const NVIDIA_MODEL_IDS = new Set(AVAILABLE_MODELS.map(model => model.id));
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
-    private readonly nvidiaClient: NvidiaClient;
-    private readonly ollamaClient: OllamaClient;
+    private readonly modelRouter: ModelRouter;
     private messages: ChatMessage[] = [];
     private lastModel?: string;
     private actionCounter = 0;
-    private modelCache?: { expiresAt: number; models: ModelOption[]; defaultModel: string };
-    private modelLoad?: Promise<{ models: ModelOption[]; defaultModel: string }>;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
         private readonly extensionContext: vscode.ExtensionContext
     ) {
-        this.nvidiaClient = new NvidiaClient();
-        this.ollamaClient = new OllamaClient();
+        this.modelRouter = new ModelRouter();
         this.messages = this.loadHistory();
     }
 
@@ -70,7 +62,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                     this.postHistory();
                     break;
                 case 'getModels': {
-                    const { models, defaultModel } = await this.listAvailableModels();
+                    const { models, defaultModel } = await this.modelRouter.listModels();
                     this._view?.webview.postMessage({ type: 'modelsLoaded', models, defaultModel });
                     break;
                 }
@@ -138,7 +130,7 @@ If an edit is needed, return the full updated content for ${fileName}.`;
 
         try {
             let fullResponse = '';
-            const selectedModel = this.resolveModel(model);
+            const selectedModel = await this.modelRouter.resolve(model);
             this.lastModel = selectedModel.value;
             const workspaceContext = await collectWorkspaceContext(contextHint);
             const requestMessages = [
@@ -152,9 +144,7 @@ If an edit is needed, return the full updated content for ${fileName}.`;
                 ...this.messages.slice(-12)
             ];
 
-            const stream = selectedModel.provider === 'ollama'
-                ? this.ollamaClient.chatStream(requestMessages, { model: selectedModel.model })
-                : this.nvidiaClient.chatStream(requestMessages, { model: selectedModel.model });
+            const stream = this.modelRouter.chatStream(requestMessages, selectedModel);
 
             for await (const chunk of stream) {
                 fullResponse += chunk;
@@ -166,7 +156,7 @@ If an edit is needed, return the full updated content for ${fileName}.`;
             this._view.webview.postMessage({ type: 'endStream' });
 
             const actionCount = await this.processAgentActions(fullResponse, contextHint);
-            if (actionCount === 0 && this.shouldRequireFileActions(contextHint) && !isCorrectionRetry) {
+            if (actionCount === 0 && shouldRequireFileActions(contextHint) && !isCorrectionRetry) {
                 await this.retryAsAgentAction(contextHint, selectedModel.value);
             }
         } catch (error: unknown) {
@@ -207,81 +197,6 @@ If an edit is needed, return the full updated content for ${fileName}.`;
         });
     }
 
-    private async listAvailableModels(): Promise<{ models: ModelOption[]; defaultModel: string }> {
-        const now = Date.now();
-        if (this.modelCache && this.modelCache.expiresAt > now) {
-            return this.modelCache;
-        }
-
-        if (!this.modelLoad) {
-            this.modelLoad = this.loadAvailableModels().finally(() => {
-                this.modelLoad = undefined;
-            });
-        }
-
-        return this.modelLoad;
-    }
-
-    private async loadAvailableModels(): Promise<{ models: ModelOption[]; defaultModel: string }> {
-        const nvidiaModels = this.nvidiaClient.listModels().map(model => ({
-            id: `${NVIDIA_MODEL_PREFIX}${model.id}`,
-            label: model.label,
-            provider: 'nvidia' as const
-        }));
-        const localModelNames = await this.ollamaClient.listModels();
-        const localModels = localModelNames.map(name => ({
-            id: `${OLLAMA_MODEL_PREFIX}${name}`,
-            label: `Local Llama/Ollama: ${name}`,
-            provider: 'ollama' as const
-        }));
-        const models = [...localModels, ...nvidiaModels];
-        const defaultModel = this.getDefaultModelValue(localModelNames);
-
-        this.modelCache = {
-            expiresAt: Date.now() + MODEL_CACHE_MS,
-            models,
-            defaultModel
-        };
-        return this.modelCache;
-    }
-
-    private getDefaultModelValue(localModels: string[]): string {
-        const configuredLocal = vscode.workspace.getConfiguration('aether').get<string>('defaultModel', '').trim();
-        if (configuredLocal && localModels.includes(configuredLocal)) {
-            return `${OLLAMA_MODEL_PREFIX}${configuredLocal}`;
-        }
-
-        const nvidiaApiKey = vscode.workspace.getConfiguration('aether').get<string>('nvidiaApiKey', '').trim();
-        if (!nvidiaApiKey && localModels.length > 0) {
-            return `${OLLAMA_MODEL_PREFIX}${localModels[0]}`;
-        }
-
-        return `${NVIDIA_MODEL_PREFIX}${this.nvidiaClient.getDefaultModel()}`;
-    }
-
-    private resolveModel(model?: string): SelectedModel {
-        if (model?.startsWith(OLLAMA_MODEL_PREFIX)) {
-            const modelName = model.slice(OLLAMA_MODEL_PREFIX.length);
-            if (modelName) {
-                return { provider: 'ollama', model: modelName, value: model };
-            }
-        }
-
-        if (model?.startsWith(NVIDIA_MODEL_PREFIX)) {
-            const modelName = model.slice(NVIDIA_MODEL_PREFIX.length);
-            if (NVIDIA_MODEL_IDS.has(modelName)) {
-                return { provider: 'nvidia', model: modelName, value: model };
-            }
-        }
-
-        if (model && NVIDIA_MODEL_IDS.has(model)) {
-            return { provider: 'nvidia', model, value: `${NVIDIA_MODEL_PREFIX}${model}` };
-        }
-
-        const fallback = this.nvidiaClient.getDefaultModel();
-        return { provider: 'nvidia', model: fallback, value: `${NVIDIA_MODEL_PREFIX}${fallback}` };
-    }
-
     private async retryAsAgentAction(originalRequest: string, model: string) {
         const correction = `Your previous response did not contain any Aether tool actions. This is an implementation task, so do not explain or give instructions. Produce the next required create/edit/read_file/run_command action now for this user request:\n\n${originalRequest}`;
         const actionId = this.nextActionId();
@@ -305,9 +220,9 @@ If an edit is needed, return the full updated content for ${fileName}.`;
 
     private async processAgentActions(response: string, contextHint: string): Promise<number> {
         try {
-            const actions = this.extractActions(response);
+            const actions = extractActions(response);
             if (actions.length === 0) {
-                const fallback = this.createActiveEditorFallbackAction(response, contextHint);
+                const fallback = createActiveEditorFallbackAction(response, contextHint);
                 if (fallback) {
                     actions.push(fallback);
                 }
@@ -453,209 +368,6 @@ If an edit is needed, return the full updated content for ${fileName}.`;
             `Command: ${command}\nExit code: ${result.exitCode}\n${output}`,
             model
         );
-    }
-
-    private extractActions(response: string): AgentAction[] {
-        const actions: AgentAction[] = [
-            ...this.extractFencedFileActions(response),
-            ...this.extractMarkdownFileActions(response)
-        ];
-
-        for (const candidate of this.extractJsonCandidates(response)) {
-            try {
-                const parsed = JSON.parse(candidate);
-                const parsedActions = Array.isArray(parsed.actions) ? parsed.actions : [parsed];
-
-                for (const action of parsedActions) {
-                    if (
-                        (action.type === 'create' || action.type === 'edit') &&
-                        typeof action.file === 'string' &&
-                        typeof action.content === 'string'
-                    ) {
-                        actions.push(action);
-                    } else if (
-                        action.type === 'read_file' &&
-                        typeof action.file === 'string'
-                    ) {
-                        actions.push(action);
-                    } else if (
-                        action.type === 'run_command' &&
-                        typeof action.command === 'string'
-                    ) {
-                        actions.push(action);
-                    }
-                }
-            } catch {
-                // Ignore prose or malformed JSON fragments.
-            }
-        }
-
-        return actions;
-    }
-
-    private shouldRequireFileActions(request: string): boolean {
-        return /\b(create|build|implement|add|fix|write|update|modify|change|refactor|delete|remove|make)\b/i.test(request);
-    }
-
-    private createActiveEditorFallbackAction(response: string, request: string): FileAction | undefined {
-        if (!this.shouldRequireFileActions(request)) {
-            return undefined;
-        }
-
-        const editor = vscode.window.activeTextEditor;
-        if (!editor || editor.document.isUntitled) {
-            return undefined;
-        }
-
-        const code = this.extractFirstPlainCodeBlock(response);
-        if (!code) {
-            return undefined;
-        }
-
-        const document = editor.document;
-        const relativeFile = vscode.workspace.asRelativePath(document.uri);
-        const original = document.getText();
-        const selection = editor.selection;
-        const content = selection.isEmpty
-            ? this.insertAtPosition(original, document.offsetAt(selection.active), code)
-            : this.replaceRange(original, document.offsetAt(selection.start), document.offsetAt(selection.end), code);
-
-        return {
-            type: 'edit',
-            file: relativeFile,
-            content
-        };
-    }
-
-    private extractFirstPlainCodeBlock(response: string): string | undefined {
-        const blocks = response.matchAll(/```(?!aether-|json)(?:[A-Za-z0-9_-]+)?\n([\s\S]*?)```/g);
-        for (const block of blocks) {
-            const content = block[1].replace(/\s+$/, '');
-            if (content.length > 0 && !content.trim().startsWith('{')) {
-                return content;
-            }
-        }
-
-        return undefined;
-    }
-
-    private replaceRange(original: string, start: number, end: number, replacement: string): string {
-        return `${original.slice(0, start)}${replacement}${original.slice(end)}`;
-    }
-
-    private insertAtPosition(original: string, offset: number, insertion: string): string {
-        const prefix = original.slice(0, offset);
-        const suffix = original.slice(offset);
-        const before = prefix.endsWith('\n') || prefix.length === 0 ? '' : '\n';
-        const after = suffix.startsWith('\n') || suffix.length === 0 ? '' : '\n';
-        return `${prefix}${before}${insertion}${after}${suffix}`;
-    }
-
-    private extractFencedFileActions(response: string): AgentAction[] {
-        const actions: AgentAction[] = [];
-        const blocks = response.matchAll(/```aether-(create|edit)\s+(?:path|file)=([^\n]+)\n([\s\S]*?)```/g);
-
-        for (const block of blocks) {
-            const type = block[1] as 'create' | 'edit';
-            const file = block[2].trim().replace(/^["']|["']$/g, '');
-            const content = block[3].replace(/\s+$/, '');
-
-            if (file && content.length > 0) {
-                actions.push({ type, file, content });
-            }
-        }
-
-        return actions;
-    }
-
-    private extractMarkdownFileActions(response: string): AgentAction[] {
-        const actions: AgentAction[] = [];
-        const blocks = response.matchAll(/(?:^|\n)(?:#{1,4}\s*)?(?:(File|Create|Edit):)?\s*`?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)`?\s*:?\s*\n```[A-Za-z0-9_-]*\n([\s\S]*?)```/g);
-
-        for (const block of blocks) {
-            const mode = block[1]?.toLowerCase();
-            const file = block[2].trim().replace(/\\/g, '/');
-            const content = block[3].replace(/\s+$/, '');
-
-            if (!this.looksLikeProjectFile(file) || content.length === 0) {
-                continue;
-            }
-
-            actions.push({
-                type: mode === 'edit' ? 'edit' : 'create',
-                file,
-                content
-            });
-        }
-
-        return actions;
-    }
-
-    private looksLikeProjectFile(file: string): boolean {
-        if (file.startsWith('.') || file.includes('..') || file.includes('://')) {
-            return false;
-        }
-
-        return /^[A-Za-z0-9_./-]+\.[A-Za-z0-9]+$/.test(file);
-    }
-
-    private extractJsonCandidates(response: string): string[] {
-        const candidates: string[] = [];
-        const fencedBlocks = response.matchAll(/```(?:json)?\s*([\s\S]*?)```/g);
-
-        for (const match of fencedBlocks) {
-            candidates.push(match[1].trim());
-        }
-
-        candidates.push(...this.extractBalancedJsonObjects(response));
-
-        return candidates;
-    }
-
-    private extractBalancedJsonObjects(text: string): string[] {
-        const objects: string[] = [];
-        let start = -1;
-        let depth = 0;
-        let inString = false;
-        let escaped = false;
-
-        for (let index = 0; index < text.length; index += 1) {
-            const char = text[index];
-
-            if (inString) {
-                if (escaped) {
-                    escaped = false;
-                } else if (char === '\\') {
-                    escaped = true;
-                } else if (char === '"') {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (char === '"') {
-                inString = true;
-                continue;
-            }
-
-            if (char === '{') {
-                if (depth === 0) {
-                    start = index;
-                }
-                depth += 1;
-                continue;
-            }
-
-            if (char === '}') {
-                depth -= 1;
-                if (depth === 0 && start !== -1) {
-                    objects.push(text.slice(start, index + 1));
-                    start = -1;
-                }
-            }
-        }
-
-        return objects;
     }
 
     private nextActionId(): string {

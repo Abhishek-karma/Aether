@@ -1,7 +1,7 @@
 {
   "name": "aether",
   "displayName": "Aether",
-  "description": "AI coding assistant powered by NVIDIA NIM models",
+  "description": "AI coding assistant powered by NVIDIA NIM and local Ollama models",
   "version": "0.2.0",
   "engines": {
     "vscode": "^1.85.0"
@@ -54,7 +54,7 @@
         "aether.nvidiaApiKey": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Your **NVIDIA NIM API key**. Get one at [build.nvidia.com](https://build.nvidia.com). Stored in VS Code settings — consider using a [Settings Sync secret](https://code.visualstudio.com/docs/editor/settings-sync) for security."
+          "markdownDescription": "Your **NVIDIA NIM API key**. Get one at [build.nvidia.com](https://build.nvidia.com). Stored in VS Code settings; consider using a [Settings Sync secret](https://code.visualstudio.com/docs/editor/settings-sync) for security."
         },
         "aether.nvidiaModel": {
           "type": "string",
@@ -73,19 +73,19 @@
             "qwen/qwen2.5-coder-32b-instruct"
           ],
           "enumDescriptions": [
-            "Z-AI GLM 5.1 — thinking model with reasoning tokens (ZML)",
-            "DeepSeek R1 — open-source reasoning/CoT model",
-            "DeepSeek V3 — fast general-purpose model",
-            "Llama 3.3 70B Instruct — Meta's latest instruction-tuned model",
-            "Llama 3.1 405B Instruct — Meta's largest open model",
-            "Mistral Large 2 — Mistral's flagship model",
-            "Mixtral 8x22B — Mistral MoE model",
-            "Nemotron 70B — NVIDIA fine-tuned Llama for coding",
-            "Gemma 3 27B — Google's open model",
-            "Phi-3 Medium 128K — Microsoft's small-but-capable model",
-            "Qwen 2.5 Coder 32B — Alibaba's coding-specialized model"
+            "Z-AI GLM 5.1 - thinking model with reasoning tokens (ZML)",
+            "DeepSeek R1 - open-source reasoning/CoT model",
+            "DeepSeek V3 - fast general-purpose model",
+            "Llama 3.3 70B Instruct - Meta's latest instruction-tuned model",
+            "Llama 3.1 405B Instruct - Meta's largest open model",
+            "Mistral Large 2 - Mistral's flagship model",
+            "Mixtral 8x22B - Mistral MoE model",
+            "Nemotron 70B - NVIDIA fine-tuned Llama for coding",
+            "Gemma 3 27B - Google's open model",
+            "Phi-3 Medium 128K - Microsoft's small-but-capable model",
+            "Qwen 2.5 Coder 32B - Alibaba's coding-specialized model"
           ],
-          "description": "Default NVIDIA NIM model. Can be overridden per-session in the chat toolbar."
+          "description": "Configured NVIDIA NIM model shown in the chat toolbar."
         },
         "aether.ollamaBaseUrl": {
           "type": "string",
@@ -117,13 +117,11 @@
     "vscode:prepublish": "npm run package",
     "package": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "npm run test-compile",
     "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
     "esbuild": "npm run esbuild-base -- --sourcemap",
-    "esbuild-watch": "npm run esbuild-base -- --sourcemap --watch",
     "test-compile": "tsc -p ./"
   },
   "devDependencies": {

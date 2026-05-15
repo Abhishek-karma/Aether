@@ -11,9 +11,11 @@
     const newChatBtn = document.getElementById('new-chat-btn');
     const historyBtn = document.getElementById('history-btn');
     const settingsBtn = document.getElementById('settings-btn');
+    const autoApproveBtn = document.getElementById('auto-approve-btn');
     const inputContainer = document.getElementById('input-container');
 
     let isStreaming = false;
+    let autoApproveEnabled = false;
     let currentAssistantMessage = null;
     let parseTimer = null;
     const toolCards = new Map();
@@ -124,6 +126,16 @@
         }
     }
 
+    function updateAutoApproveUI() {
+        if (autoApproveEnabled) {
+            autoApproveBtn.classList.add('toggled');
+            autoApproveBtn.title = 'Auto-Approve ON — changes applied automatically';
+        } else {
+            autoApproveBtn.classList.remove('toggled');
+            autoApproveBtn.title = 'Auto-Approve OFF — click to enable';
+        }
+    }
+
     chatInput.addEventListener('input', function () {
         chatInput.style.height = 'auto';
         chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
@@ -149,6 +161,7 @@
     newChatBtn.onclick = function () { vscode.postMessage({ type: 'clearHistory' }); };
     historyBtn.onclick = function () { vscode.postMessage({ type: 'showHistory' }); };
     settingsBtn.onclick = function () { vscode.postMessage({ type: 'openSettings' }); };
+    autoApproveBtn.onclick = function () { vscode.postMessage({ type: 'toggleAutoApprove' }); };
 
     function sendMessage() {
         var text = chatInput.value.trim();
@@ -164,6 +177,10 @@
     window.addEventListener('message', function (event) {
         var message = event.data;
         switch (message.type) {
+            case 'autoApproveChanged':
+                autoApproveEnabled = message.enabled;
+                updateAutoApproveUI();
+                break;
             case 'historyLoaded':
                 messagesContainer.innerHTML = '';
                 if (message.messages && message.messages.length > 0) {
@@ -236,27 +253,44 @@
         var card = document.createElement('div');
         card.className = 'tool-card';
         card.dataset.actionId = message.actionId;
-        card.innerHTML =
-            '<div class="tool-header">' +
-            '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M14.5 2H6L5.5 2.5v11l.5.5h8l.5-.5v-11l-.5-.5zM14 13H6V3h8v10zM4 5.5l-.5-.5H1v1h2V14h9v2H2.5l-.5-.5v-10z"/></svg> ' +
-            (message.actionType === 'create' ? 'Create File' : 'Edit File') +
-            '</div>' +
-            '<div style="font-family:var(--vscode-editor-font-family); opacity:0.8; margin-bottom:12px; font-size:11px; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(message.file) + '</div>' +
-            '<div style="display:flex; gap:8px;">' +
-            '<button class="primary preview-btn">Diff</button>' +
-            '<button class="primary accept-btn">Apply</button>' +
-            '<button class="secondary reject-btn">Ignore</button>' +
-            '</div>';
+
+        if (message.autoApplied) {
+            // Auto-applied: show a compact status card (no buttons)
+            card.innerHTML =
+                '<div class="tool-header">' +
+                '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M14.5 2H6L5.5 2.5v11l.5.5h8l.5-.5v-11l-.5-.5zM14 13H6V3h8v10zM4 5.5l-.5-.5H1v1h2V14h9v2H2.5l-.5-.5v-10z"/></svg> ' +
+                (message.actionType === 'create' ? 'Creating' : 'Editing') + ': ' +
+                '<span style="opacity:0.7; font-weight:normal;">' + escapeHtml(message.file) + '</span>' +
+                '<span class="auto-badge">AUTO</span>' +
+                '</div>';
+        } else {
+            // Manual mode: show full interactive card
+            card.innerHTML =
+                '<div class="tool-header">' +
+                '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M14.5 2H6L5.5 2.5v11l.5.5h8l.5-.5v-11l-.5-.5zM14 13H6V3h8v10zM4 5.5l-.5-.5H1v1h2V14h9v2H2.5l-.5-.5v-10z"/></svg> ' +
+                (message.actionType === 'create' ? 'Create File' : 'Edit File') +
+                '</div>' +
+                '<div style="font-family:var(--vscode-editor-font-family); opacity:0.8; margin-bottom:12px; font-size:11px; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(message.file) + '</div>' +
+                '<div style="display:flex; gap:8px;">' +
+                '<button class="primary preview-btn">Diff</button>' +
+                '<button class="primary accept-btn">Apply</button>' +
+                '<button class="secondary reject-btn">Ignore</button>' +
+                '</div>';
+        }
+
         messagesContainer.appendChild(card);
         scrollToBottom();
-        card.querySelector('.preview-btn').onclick = function () {
-            vscode.postMessage({ type: 'previewAction', original: message.original, content: message.content, fullPath: message.fullPath });
-        };
-        card.querySelector('.accept-btn').onclick = function () {
-            card.querySelector('.tool-header').textContent = 'Applying...';
-            vscode.postMessage({ type: 'acceptAction', actionId: message.actionId, actionType: message.actionType, file: message.file, content: message.content });
-        };
-        card.querySelector('.reject-btn').onclick = function () { card.remove(); };
+
+        if (!message.autoApplied) {
+            card.querySelector('.preview-btn').onclick = function () {
+                vscode.postMessage({ type: 'previewAction', original: message.original, content: message.content, fullPath: message.fullPath });
+            };
+            card.querySelector('.accept-btn').onclick = function () {
+                card.querySelector('.tool-header').textContent = 'Applying...';
+                vscode.postMessage({ type: 'acceptAction', actionId: message.actionId, actionType: message.actionType, file: message.file, content: message.content });
+            };
+            card.querySelector('.reject-btn').onclick = function () { card.remove(); };
+        }
     }
 
     function updateFileActionCard(message) {
@@ -269,11 +303,25 @@
                 buttons.forEach(function (b) { b.remove(); });
             } else {
                 card.querySelector('.tool-header').textContent = 'Failed: ' + message.message;
+                card.style.borderColor = '#f48771';
             }
         }
     }
 
     function showCommandCard(message) {
+        if (message.autoApplied) {
+            // Auto-run: show compact running card
+            var card = createToolCard(message.actionId, 'Command', message.command, 'running');
+            var badge = document.createElement('span');
+            badge.className = 'auto-badge';
+            badge.textContent = 'AUTO';
+            card.root.querySelector('.status-pill').parentElement.appendChild(badge);
+            toolCards.set(message.actionId, card);
+            messagesContainer.appendChild(card.root);
+            scrollToBottom();
+            return;
+        }
+
         var card = createToolCard(message.actionId, 'Command', message.command, 'pending');
         var desc = document.createElement('div');
         desc.style.cssText = 'font-size:11px; opacity:0.7; margin-top:4px;';
@@ -324,4 +372,5 @@
 
     // Init
     showEmptyState();
+    updateAutoApproveUI();
 })();

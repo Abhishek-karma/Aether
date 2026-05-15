@@ -62,6 +62,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 case 'showHistory':
                     vscode.commands.executeCommand('aether.showHistory');
                     break;
+                case 'toggleAutoApprove':
+                    vscode.commands.executeCommand('aether.toggleAutoApprove');
+                    break;
                 case 'openSettings':
                     vscode.commands.executeCommand('workbench.action.openSettings', 'aether');
                     break;
@@ -232,6 +235,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         .typing-dots span:nth-child(2) { animation-delay:0.2s; }
         .typing-dots span:nth-child(3) { animation-delay:0.4s; }
         @keyframes blink { 0%,100% { opacity:0.4; transform:scale(1); } 50% { opacity:1; transform:scale(1.1); } }
+
+        .auto-approve-btn { position:relative; transition:all 0.2s; }
+        .auto-approve-btn.toggled { color:#89d185 !important; background:rgba(137,209,133,0.15) !important; }
+        .auto-approve-btn.toggled::after { content:''; position:absolute; bottom:2px; left:50%; transform:translateX(-50%); width:4px; height:4px; border-radius:50%; background:#89d185; }
+        .auto-badge { display:inline-block; background:rgba(137,209,133,0.2); color:#89d185; font-size:9px; font-weight:700; padding:1px 5px; border-radius:3px; margin-left:8px; letter-spacing:0.5px; vertical-align:middle; }
     </style>
 </head>
 <body>
@@ -246,6 +254,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <div class="header-title">Aether</div>
         </div>
         <div class="header-right">
+            <button class="icon-btn auto-approve-btn" aria-label="Auto-Approve" id="auto-approve-btn" title="Auto-Approve OFF — click to enable">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M5.56 7.56L4.5 8.62 7.44 11.56 13.5 5.5 12.44 4.44 7.44 9.44zM8 1a7 7 0 100 14A7 7 0 008 1zm0 12.6A5.6 5.6 0 1113.6 8 5.61 5.61 0 018 13.6z"/></svg>
+            </button>
             <button class="icon-btn" aria-label="History" id="history-btn" title="Chat History">
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 8a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0zM8 3v5l3.15 1.88.7-1.18L9 7.25V3H8z"/></svg>
             </button>

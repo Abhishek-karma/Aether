@@ -9,27 +9,32 @@ export interface FileOperationResult {
 }
 
 /**
- * Creates a new file at the given path. If the file already exists,
- * prompts the user to confirm overwrite instead of silently failing.
+ * Creates a new file at the given path.
+ * If autoApprove is true, overwrites without prompting.
+ * Otherwise prompts the user to confirm overwrite.
  */
-export async function createFile(filePath: string, content: string): Promise<FileOperationResult> {
+export async function createFile(filePath: string, content: string, autoApprove: boolean = false): Promise<FileOperationResult> {
     const uri = vscode.Uri.file(filePath);
 
     try {
         await vscode.workspace.fs.stat(uri);
         
-        // File exists — ask user whether to overwrite
-        const choice = await vscode.window.showWarningMessage(
-            `File already exists: ${path.basename(filePath)}. Overwrite?`,
-            { modal: false },
-            'Overwrite',
-            'Cancel'
-        );
+        if (!autoApprove) {
+            // File exists — ask user whether to overwrite
+            const choice = await vscode.window.showWarningMessage(
+                `File already exists: ${path.basename(filePath)}. Overwrite?`,
+                { modal: false },
+                'Overwrite',
+                'Cancel'
+            );
 
-        if (choice !== 'Overwrite') {
-            const message = `Skipped existing file: ${filePath}`;
-            logInfo(message);
-            return { ok: false, message };
+            if (choice !== 'Overwrite') {
+                const message = `Skipped existing file: ${filePath}`;
+                logInfo(message);
+                return { ok: false, message };
+            }
+        } else {
+            logInfo(`Auto-approve: overwriting ${filePath}`);
         }
     } catch {
         // File does not exist, safe to create
@@ -46,7 +51,9 @@ export async function createFile(filePath: string, content: string): Promise<Fil
 
     const message = `File created: ${filePath}`;
     logInfo(message);
-    vscode.window.showInformationMessage(message);
+    if (!autoApprove) {
+        vscode.window.showInformationMessage(message);
+    }
     return { ok: true, message };
 }
 

@@ -45,6 +45,8 @@ const edit_1 = require("./tools/edit");
 const file_1 = require("./tools/file");
 const terminal_1 = require("./tools/terminal");
 const logger_1 = require("./utils/logger");
+/** Global auto-approve state — when true, file actions are applied without user confirmation. */
+let autoApproveEnabled = false;
 function activate(context) {
     // Initialize shared output channel
     const outputChannel = (0, logger_1.getOutputChannel)();
@@ -72,6 +74,12 @@ function activate(context) {
     const stopGenerationCommand = vscode.commands.registerCommand('aether.stopGeneration', () => {
         modelRouter.abort();
     });
+    // Command: Toggle Auto-Approve
+    const toggleAutoApproveCommand = vscode.commands.registerCommand('aether.toggleAutoApprove', () => {
+        autoApproveEnabled = !autoApproveEnabled;
+        (0, logger_1.logInfo)(`Auto-approve ${autoApproveEnabled ? 'ENABLED' : 'DISABLED'}`);
+        chatViewProvider.postMessage({ type: 'autoApproveChanged', enabled: autoApproveEnabled });
+    });
     // Command: Send Message
     const sendMessageCommand = vscode.commands.registerCommand('aether.sendMessage', async (text, modelId) => {
         const history = chatHistory.activeSession.messages;
@@ -96,35 +104,96 @@ function activate(context) {
             // Save assistant message
             await chatHistory.appendMessage({ role: 'assistant', content: fullResponse });
             chatViewProvider.postMessage({ type: 'endStream' });
-            // Detect and show actions
+            // Detect and process actions
             const actions = (0, actions_1.extractActions)(fullResponse);
             for (const action of actions) {
                 if (action.type === 'create' || action.type === 'edit') {
                     const fullPath = (0, file_1.resolveSafeFilePath)(action.file);
-                    let original = '';
-                    if (action.type === 'edit') {
-                        try {
-                            original = await (0, file_1.readFile)(fullPath);
+                    if (autoApproveEnabled) {
+                        // Auto-apply: execute immediately, show a minimal status card
+                        const actionId = Math.random().toString(36).slice(2);
+                        chatViewProvider.postMessage({
+                            type: 'showActionCard',
+                            actionId,
+                            actionType: action.type,
+                            file: action.file,
+                            content: action.content,
+                            original: '',
+                            fullPath,
+                            autoApplied: true
+                        });
+                        let result;
+                        if (action.type === 'create') {
+                            result = await (0, file_1.createFile)(fullPath, action.content, true);
                         }
-                        catch { /* ignore */ }
+                        else {
+                            result = await (0, edit_1.applyEdit)(fullPath, action.content);
+                        }
+                        chatViewProvider.postMessage({
+                            type: 'fileActionResult',
+                            actionId,
+                            ok: result.ok,
+                            message: result.message
+                        });
+                        (0, logger_1.logInfo)(`Auto-applied ${action.type}: ${action.file} — ${result.ok ? 'OK' : 'FAILED'}`);
                     }
-                    chatViewProvider.postMessage({
-                        type: 'showActionCard',
-                        actionId: Math.random().toString(36).slice(2),
-                        actionType: action.type,
-                        file: action.file,
-                        content: action.content,
-                        original,
-                        fullPath
-                    });
+                    else {
+                        // Manual mode: show interactive action card
+                        let original = '';
+                        if (action.type === 'edit') {
+                            try {
+                                original = await (0, file_1.readFile)(fullPath);
+                            }
+                            catch { /* ignore */ }
+                        }
+                        chatViewProvider.postMessage({
+                            type: 'showActionCard',
+                            actionId: Math.random().toString(36).slice(2),
+                            actionType: action.type,
+                            file: action.file,
+                            content: action.content,
+                            original,
+                            fullPath
+                        });
+                    }
                 }
                 else if (action.type === 'run_command') {
-                    chatViewProvider.postMessage({
-                        type: 'showCommandCard',
-                        actionId: Math.random().toString(36).slice(2),
-                        command: action.command,
-                        reason: action.reason || 'Requested by Aether'
-                    });
+                    if (autoApproveEnabled) {
+                        // Auto-run commands too
+                        const actionId = Math.random().toString(36).slice(2);
+                        chatViewProvider.postMessage({
+                            type: 'showCommandCard',
+                            actionId,
+                            command: action.command,
+                            reason: action.reason || 'Auto-executed by Aether',
+                            autoApplied: true
+                        });
+                        try {
+                            const result = await (0, terminal_1.runCommand)(action.command);
+                            chatViewProvider.postMessage({
+                                type: 'updateToolCard',
+                                actionId,
+                                status: result.exitCode === 0 ? 'done' : 'error',
+                                output: result.stdout + (result.stderr ? '\n' + result.stderr : '')
+                            });
+                        }
+                        catch (error) {
+                            chatViewProvider.postMessage({
+                                type: 'updateToolCard',
+                                actionId,
+                                status: 'error',
+                                output: error.message
+                            });
+                        }
+                    }
+                    else {
+                        chatViewProvider.postMessage({
+                            type: 'showCommandCard',
+                            actionId: Math.random().toString(36).slice(2),
+                            command: action.command,
+                            reason: action.reason || 'Requested by Aether'
+                        });
+                    }
                 }
             }
         }
@@ -133,7 +202,7 @@ function activate(context) {
             chatViewProvider.postMessage({ type: 'error', message: error.message || 'An unknown error occurred' });
         }
     });
-    // Command: Accept File Action
+    // Command: Accept File Action (manual mode)
     const acceptActionCommand = vscode.commands.registerCommand('aether.acceptAction', async (data) => {
         const fullPath = (0, file_1.resolveSafeFilePath)(data.file);
         let result;
@@ -149,7 +218,7 @@ function activate(context) {
     const previewActionCommand = vscode.commands.registerCommand('aether.previewAction', async (data) => {
         await (0, edit_1.showDiff)(data.original || '', data.content, data.fullPath);
     });
-    // Command: Accept Command
+    // Command: Accept Command (manual mode)
     const acceptCommandCommand = vscode.commands.registerCommand('aether.acceptCommand', async (data) => {
         try {
             const result = await (0, terminal_1.runCommand)(data.command);
@@ -159,8 +228,6 @@ function activate(context) {
                 status: result.exitCode === 0 ? 'done' : 'error',
                 output: result.stdout + (result.stderr ? '\n' + result.stderr : '')
             });
-            // Removed auto-feedback loop that caused infinite LLM chatting
-            // The user can manually tell the LLM if they want to.
             if (result.exitCode !== 0) {
                 (0, logger_1.logWarn)(`Command failed, wait for user input. Exit code: ${result.exitCode}`);
             }
@@ -180,7 +247,7 @@ function activate(context) {
             return;
         }
         const items = sessions.map(s => ({
-            label: new Date(s.updatedAt).toLocaleString(),
+            label: s.title || new Date(s.updatedAt).toLocaleString(),
             description: s.messages.length > 0 ? s.messages[0].content.substring(0, 50) + '...' : 'Empty Session',
             session: s
         }));
@@ -210,7 +277,7 @@ function activate(context) {
             await chatViewProvider.submitInlineRequest(query, selection || editor.document.getText(), vscode.workspace.asRelativePath(editor.document.uri));
         }
     });
-    context.subscriptions.push(startChatCommand, newTaskCommand, stopGenerationCommand, sendMessageCommand, acceptActionCommand, previewActionCommand, acceptCommandCommand, clearHistoryCommand, showHistoryCommand, inlineChatCommand);
+    context.subscriptions.push(startChatCommand, newTaskCommand, stopGenerationCommand, toggleAutoApproveCommand, sendMessageCommand, acceptActionCommand, previewActionCommand, acceptCommandCommand, clearHistoryCommand, showHistoryCommand, inlineChatCommand);
 }
 function deactivate() {
     // Cleanup if needed

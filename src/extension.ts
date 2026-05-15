@@ -9,6 +9,9 @@ import { createFile, resolveSafeFilePath, readFile } from './tools/file';
 import { runCommand } from './tools/terminal';
 import { logInfo, logWarn, logError, getOutputChannel } from './utils/logger';
 
+/** Global auto-approve state — when true, file actions are applied without user confirmation. */
+let autoApproveEnabled = false;
+
 export function activate(context: vscode.ExtensionContext) {
     // Initialize shared output channel
     const outputChannel = getOutputChannel();
@@ -45,6 +48,13 @@ export function activate(context: vscode.ExtensionContext) {
         modelRouter.abort();
     });
 
+    // Command: Toggle Auto-Approve
+    const toggleAutoApproveCommand = vscode.commands.registerCommand('aether.toggleAutoApprove', () => {
+        autoApproveEnabled = !autoApproveEnabled;
+        logInfo(`Auto-approve ${autoApproveEnabled ? 'ENABLED' : 'DISABLED'}`);
+        chatViewProvider.postMessage({ type: 'autoApproveChanged', enabled: autoApproveEnabled });
+    });
+
     // Command: Send Message
     const sendMessageCommand = vscode.commands.registerCommand('aether.sendMessage', async (text: string, modelId?: string) => {
         const history = chatHistory.activeSession.messages;
@@ -77,32 +87,95 @@ export function activate(context: vscode.ExtensionContext) {
             await chatHistory.appendMessage({ role: 'assistant', content: fullResponse });
             chatViewProvider.postMessage({ type: 'endStream' });
 
-            // Detect and show actions
+            // Detect and process actions
             const actions = extractActions(fullResponse);
+            
             for (const action of actions) {
                 if (action.type === 'create' || action.type === 'edit') {
                     const fullPath = resolveSafeFilePath(action.file);
-                    let original = '';
-                    if (action.type === 'edit') {
-                        try { original = await readFile(fullPath); } catch { /* ignore */ }
+
+                    if (autoApproveEnabled) {
+                        // Auto-apply: execute immediately, show a minimal status card
+                        const actionId = Math.random().toString(36).slice(2);
+                        chatViewProvider.postMessage({
+                            type: 'showActionCard',
+                            actionId,
+                            actionType: action.type,
+                            file: action.file,
+                            content: action.content,
+                            original: '',
+                            fullPath,
+                            autoApplied: true
+                        });
+
+                        let result;
+                        if (action.type === 'create') {
+                            result = await createFile(fullPath, action.content, true);
+                        } else {
+                            result = await applyEdit(fullPath, action.content);
+                        }
+
+                        chatViewProvider.postMessage({
+                            type: 'fileActionResult',
+                            actionId,
+                            ok: result.ok,
+                            message: result.message
+                        });
+
+                        logInfo(`Auto-applied ${action.type}: ${action.file} — ${result.ok ? 'OK' : 'FAILED'}`);
+                    } else {
+                        // Manual mode: show interactive action card
+                        let original = '';
+                        if (action.type === 'edit') {
+                            try { original = await readFile(fullPath); } catch { /* ignore */ }
+                        }
+
+                        chatViewProvider.postMessage({
+                            type: 'showActionCard',
+                            actionId: Math.random().toString(36).slice(2),
+                            actionType: action.type,
+                            file: action.file,
+                            content: action.content,
+                            original,
+                            fullPath
+                        });
                     }
-                    
-                    chatViewProvider.postMessage({
-                        type: 'showActionCard',
-                        actionId: Math.random().toString(36).slice(2),
-                        actionType: action.type,
-                        file: action.file,
-                        content: action.content,
-                        original,
-                        fullPath
-                    });
                 } else if (action.type === 'run_command') {
-                    chatViewProvider.postMessage({
-                        type: 'showCommandCard',
-                        actionId: Math.random().toString(36).slice(2),
-                        command: action.command,
-                        reason: action.reason || 'Requested by Aether'
-                    });
+                    if (autoApproveEnabled) {
+                        // Auto-run commands too
+                        const actionId = Math.random().toString(36).slice(2);
+                        chatViewProvider.postMessage({
+                            type: 'showCommandCard',
+                            actionId,
+                            command: action.command,
+                            reason: action.reason || 'Auto-executed by Aether',
+                            autoApplied: true
+                        });
+
+                        try {
+                            const result = await runCommand(action.command);
+                            chatViewProvider.postMessage({
+                                type: 'updateToolCard',
+                                actionId,
+                                status: result.exitCode === 0 ? 'done' : 'error',
+                                output: result.stdout + (result.stderr ? '\n' + result.stderr : '')
+                            });
+                        } catch (error: any) {
+                            chatViewProvider.postMessage({
+                                type: 'updateToolCard',
+                                actionId,
+                                status: 'error',
+                                output: error.message
+                            });
+                        }
+                    } else {
+                        chatViewProvider.postMessage({
+                            type: 'showCommandCard',
+                            actionId: Math.random().toString(36).slice(2),
+                            command: action.command,
+                            reason: action.reason || 'Requested by Aether'
+                        });
+                    }
                 }
             }
         } catch (error: any) {
@@ -111,7 +184,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
 
-    // Command: Accept File Action
+    // Command: Accept File Action (manual mode)
     const acceptActionCommand = vscode.commands.registerCommand('aether.acceptAction', async (data: any) => {
         const fullPath = resolveSafeFilePath(data.file);
         let result;
@@ -128,7 +201,7 @@ export function activate(context: vscode.ExtensionContext) {
         await showDiff(data.original || '', data.content, data.fullPath);
     });
 
-    // Command: Accept Command
+    // Command: Accept Command (manual mode)
     const acceptCommandCommand = vscode.commands.registerCommand('aether.acceptCommand', async (data: any) => {
         try {
             const result = await runCommand(data.command);
@@ -139,8 +212,6 @@ export function activate(context: vscode.ExtensionContext) {
                 output: result.stdout + (result.stderr ? '\n' + result.stderr : '')
             });
             
-            // Removed auto-feedback loop that caused infinite LLM chatting
-            // The user can manually tell the LLM if they want to.
             if (result.exitCode !== 0) {
                 logWarn(`Command failed, wait for user input. Exit code: ${result.exitCode}`);
             }
@@ -162,7 +233,7 @@ export function activate(context: vscode.ExtensionContext) {
         }
 
         const items = sessions.map(s => ({
-            label: new Date(s.updatedAt).toLocaleString(),
+            label: s.title || new Date(s.updatedAt).toLocaleString(),
             description: s.messages.length > 0 ? s.messages[0].content.substring(0, 50) + '...' : 'Empty Session',
             session: s
         }));
@@ -206,6 +277,7 @@ export function activate(context: vscode.ExtensionContext) {
         startChatCommand, 
         newTaskCommand, 
         stopGenerationCommand,
+        toggleAutoApproveCommand,
         sendMessageCommand, 
         acceptActionCommand, 
         previewActionCommand, 

@@ -42,19 +42,25 @@ const path = __importStar(require("path"));
 const workspace_1 = require("./workspace");
 const logger_1 = require("../utils/logger");
 /**
- * Creates a new file at the given path. If the file already exists,
- * prompts the user to confirm overwrite instead of silently failing.
+ * Creates a new file at the given path.
+ * If autoApprove is true, overwrites without prompting.
+ * Otherwise prompts the user to confirm overwrite.
  */
-async function createFile(filePath, content) {
+async function createFile(filePath, content, autoApprove = false) {
     const uri = vscode.Uri.file(filePath);
     try {
         await vscode.workspace.fs.stat(uri);
-        // File exists — ask user whether to overwrite
-        const choice = await vscode.window.showWarningMessage(`File already exists: ${path.basename(filePath)}. Overwrite?`, { modal: false }, 'Overwrite', 'Cancel');
-        if (choice !== 'Overwrite') {
-            const message = `Skipped existing file: ${filePath}`;
-            (0, logger_1.logInfo)(message);
-            return { ok: false, message };
+        if (!autoApprove) {
+            // File exists — ask user whether to overwrite
+            const choice = await vscode.window.showWarningMessage(`File already exists: ${path.basename(filePath)}. Overwrite?`, { modal: false }, 'Overwrite', 'Cancel');
+            if (choice !== 'Overwrite') {
+                const message = `Skipped existing file: ${filePath}`;
+                (0, logger_1.logInfo)(message);
+                return { ok: false, message };
+            }
+        }
+        else {
+            (0, logger_1.logInfo)(`Auto-approve: overwriting ${filePath}`);
         }
     }
     catch {
@@ -68,7 +74,9 @@ async function createFile(filePath, content) {
     await vscode.window.showTextDocument(document, { preview: false });
     const message = `File created: ${filePath}`;
     (0, logger_1.logInfo)(message);
-    vscode.window.showInformationMessage(message);
+    if (!autoApprove) {
+        vscode.window.showInformationMessage(message);
+    }
     return { ok: true, message };
 }
 async function readFile(filePath) {

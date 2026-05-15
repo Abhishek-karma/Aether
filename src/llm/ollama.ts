@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { logInfo, logError } from '../utils/logger';
 
 export interface OllamaMessage {
     role: 'system' | 'user' | 'assistant';
@@ -11,7 +12,7 @@ export interface OllamaOptions {
     num_ctx?: number;
 }
 
-const MODEL_LIST_TIMEOUT_MS = 1500;
+const MODEL_LIST_TIMEOUT_MS = 3000;
 
 export class OllamaClient {
     private get baseUrl(): string {
@@ -27,7 +28,7 @@ export class OllamaClient {
     }
 
     /**
-     * Lists available models on the local Ollama instance
+     * Lists available models on the local Ollama instance.
      */
     async listModels(): Promise<string[]> {
         const controller = new AbortController();
@@ -38,11 +39,17 @@ export class OllamaClient {
                 throw new Error(`Failed to list models: ${response.statusText}`);
             }
             const data = await response.json() as { models: Array<{ name: string }> };
-            return data.models
+            const models = data.models
                 .map(m => m.name)
                 .sort((a, b) => a.localeCompare(b));
+            logInfo(`Ollama discovered ${models.length} local models`);
+            return models;
         } catch (error) {
-            console.error('Ollama Client Error (listModels):', error);
+            if ((error as Error).name === 'AbortError') {
+                logInfo('Ollama model list timed out — server may be offline');
+            } else {
+                logError('Ollama Client Error (listModels)', error);
+            }
             return [];
         } finally {
             clearTimeout(timeout);
@@ -50,9 +57,10 @@ export class OllamaClient {
     }
 
     /**
-     * Generates a streaming response for the chat UI
+     * Generates a streaming response for the chat UI.
+     * Supports cancellation via AbortSignal.
      */
-    async *chatStream(messages: OllamaMessage[], options: OllamaOptions): AsyncGenerator<string> {
+    async *chatStream(messages: OllamaMessage[], options: OllamaOptions, signal?: AbortSignal): AsyncGenerator<string> {
         const payload = {
             model: options.model || this.defaultModel,
             messages,
@@ -70,7 +78,8 @@ export class OllamaClient {
         const response = await fetch(`${this.baseUrl}/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal
         });
 
         if (!response.ok) {
@@ -87,8 +96,13 @@ export class OllamaClient {
 
         try {
             while (true) {
+                if (signal?.aborted) {
+                    logInfo('Ollama stream aborted by user');
+                    return;
+                }
+
                 const { done, value } = await reader.read();
-                if (done) break;
+                if (done) { break; }
 
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
@@ -97,14 +111,14 @@ export class OllamaClient {
                 buffer = lines.pop() || '';
 
                 for (const line of lines) {
-                    if (line.trim() === '') continue;
+                    if (line.trim() === '') { continue; }
                     try {
                         const parsed = JSON.parse(line);
                         if (parsed.message?.content) {
                             yield parsed.message.content;
                         }
                     } catch (e) {
-                        console.error('Error parsing Ollama stream chunk:', e, 'Line:', line);
+                        logError('Error parsing Ollama stream chunk', e);
                     }
                 }
             }
@@ -116,8 +130,8 @@ export class OllamaClient {
                     if (parsed.message?.content) {
                         yield parsed.message.content;
                     }
-                } catch (e) {
-                    // ignore
+                } catch {
+                    // ignore trailing incomplete chunk
                 }
             }
         } finally {
@@ -126,7 +140,7 @@ export class OllamaClient {
     }
 
     /**
-     * Generates a non-streaming response for tool calls / background tasks
+     * Generates a non-streaming response for tool calls / background tasks.
      */
     async generate(prompt: string, options: OllamaOptions): Promise<string> {
         const payload = {
@@ -158,7 +172,7 @@ export class OllamaClient {
     }
 
     /**
-     * Generates embeddings for semantic search
+     * Generates embeddings for semantic search.
      */
     async generateEmbeddings(text: string, model: string = 'nomic-embed-text'): Promise<number[]> {
         const response = await fetch(`${this.baseUrl}/embeddings`, {

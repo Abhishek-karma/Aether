@@ -35,17 +35,20 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ModelRouter = void 0;
 const vscode = __importStar(require("vscode"));
-const nvidia_1 = require("./nvidia");
+const gemini_1 = require("./gemini");
 const ollama_1 = require("./ollama");
-const MODEL_CACHE_MS = 10000;
-const NVIDIA_MODEL_PREFIX = 'nvidia::';
+const logger_1 = require("../utils/logger");
+const MODEL_CACHE_MS = 15_000;
+const GEMINI_MODEL_PREFIX = 'gemini::';
 const OLLAMA_MODEL_PREFIX = 'ollama::';
-const NVIDIA_MODEL_IDS = new Set(nvidia_1.AVAILABLE_MODELS.map(model => model.id));
+const GEMINI_MODEL_IDS = new Set(gemini_1.AVAILABLE_MODELS.map(model => model.id));
 class ModelRouter {
-    nvidiaClient = new nvidia_1.NvidiaClient();
+    geminiClient = new gemini_1.GeminiClient();
     ollamaClient = new ollama_1.OllamaClient();
     modelCache;
     modelLoad;
+    /** Currently active AbortController — cancelled when the user stops generation. */
+    _activeAbort;
     async listModels() {
         const now = Date.now();
         if (this.modelCache && this.modelCache.expiresAt > now) {
@@ -64,81 +67,121 @@ class ModelRouter {
             return explicit;
         }
         const { defaultModel } = await this.listModels();
-        return this.resolveExplicitModel(defaultModel) ?? this.configuredNvidiaSelection();
+        return this.resolveExplicitModel(defaultModel) ?? this.configuredGeminiSelection();
     }
+    /**
+     * Streams a chat completion. Returns an AsyncGenerator of string chunks.
+     * Creates an internal AbortController that can be cancelled via `abort()`.
+     */
     chatStream(messages, selectedModel) {
+        this._activeAbort?.abort();
+        this._activeAbort = new AbortController();
+        const signal = this._activeAbort.signal;
+        (0, logger_1.logInfo)(`Streaming via ${selectedModel.provider}: ${selectedModel.model}`);
         if (selectedModel.provider === 'ollama') {
-            return this.ollamaClient.chatStream(messages, { model: selectedModel.model });
+            return this.ollamaClient.chatStream(messages, { model: selectedModel.model }, signal);
         }
-        return this.nvidiaClient.chatStream(messages, { model: selectedModel.model });
+        return this.geminiClient.chatStream(messages, { model: selectedModel.model }, signal);
+    }
+    /** Aborts the currently active chat stream, if any. */
+    abort() {
+        if (this._activeAbort) {
+            (0, logger_1.logInfo)('User aborted generation');
+            this._activeAbort.abort();
+            this._activeAbort = undefined;
+        }
+    }
+    /** Invalidates the model cache so the next listModels() call fetches fresh data. */
+    invalidateCache() {
+        this.modelCache = undefined;
     }
     async loadModels() {
-        const configuredNvidia = this.configuredNvidiaOption();
-        const localModelNames = await this.ollamaClient.listModels();
+        // Gemini cloud models
+        const geminiModels = gemini_1.AVAILABLE_MODELS.map(m => ({
+            id: `${GEMINI_MODEL_PREFIX}${m.id}`,
+            label: m.label,
+            provider: 'gemini'
+        }));
+        // Local Ollama models
+        let localModelNames = [];
+        try {
+            localModelNames = await this.ollamaClient.listModels();
+        }
+        catch (error) {
+            (0, logger_1.logError)('Failed to list Ollama models', error);
+        }
         const localModels = localModelNames.map(name => ({
             id: `${OLLAMA_MODEL_PREFIX}${name}`,
-            label: `Local Llama/Ollama: ${name}`,
+            label: `Local: ${name}`,
             provider: 'ollama'
         }));
         this.modelCache = {
             expiresAt: Date.now() + MODEL_CACHE_MS,
-            models: [...localModels, configuredNvidia],
+            models: [...geminiModels, ...localModels],
             defaultModel: this.defaultModelValue(localModelNames)
         };
+        (0, logger_1.logInfo)(`Loaded ${geminiModels.length} Gemini + ${localModels.length} local models`);
         return this.modelCache;
     }
     defaultModelValue(localModels) {
+        // If user configured a specific local model, prefer it
         const configuredLocal = cfg('defaultModel', '').trim();
         if (configuredLocal && localModels.includes(configuredLocal)) {
             return `${OLLAMA_MODEL_PREFIX}${configuredLocal}`;
         }
-        const nvidiaApiKey = cfg('nvidiaApiKey', '').trim();
-        if (!nvidiaApiKey && localModels.length > 0) {
+        // If Gemini API key is set, default to configured Gemini model
+        const geminiApiKey = cfg('geminiApiKey', '').trim();
+        if (geminiApiKey) {
+            return this.configuredGeminiOption().id;
+        }
+        // Fall back to first local model if available
+        if (localModels.length > 0) {
             return `${OLLAMA_MODEL_PREFIX}${localModels[0]}`;
         }
-        return this.configuredNvidiaOption().id;
+        // Ultimate fallback: Gemini (will prompt for key when used)
+        return this.configuredGeminiOption().id;
     }
     resolveExplicitModel(model) {
         if (model?.startsWith(OLLAMA_MODEL_PREFIX)) {
             const modelName = model.slice(OLLAMA_MODEL_PREFIX.length);
             return modelName ? { provider: 'ollama', model: modelName, value: model } : undefined;
         }
-        if (model?.startsWith(NVIDIA_MODEL_PREFIX)) {
-            const modelName = model.slice(NVIDIA_MODEL_PREFIX.length);
-            return this.knownNvidiaSelection(modelName);
+        if (model?.startsWith(GEMINI_MODEL_PREFIX)) {
+            const modelName = model.slice(GEMINI_MODEL_PREFIX.length);
+            return this.knownGeminiSelection(modelName);
         }
-        return model ? this.knownNvidiaSelection(model) : undefined;
+        return model ? this.knownGeminiSelection(model) : undefined;
     }
-    knownNvidiaSelection(model) {
-        if (!NVIDIA_MODEL_IDS.has(model)) {
+    knownGeminiSelection(model) {
+        if (!GEMINI_MODEL_IDS.has(model)) {
             return undefined;
         }
         return {
-            provider: 'nvidia',
+            provider: 'gemini',
             model,
-            value: `${NVIDIA_MODEL_PREFIX}${model}`
+            value: `${GEMINI_MODEL_PREFIX}${model}`
         };
     }
-    configuredNvidiaSelection() {
-        const model = this.configuredNvidiaModel();
+    configuredGeminiSelection() {
+        const model = this.configuredGeminiModel();
         return {
-            provider: 'nvidia',
+            provider: 'gemini',
             model,
-            value: `${NVIDIA_MODEL_PREFIX}${model}`
+            value: `${GEMINI_MODEL_PREFIX}${model}`
         };
     }
-    configuredNvidiaOption() {
-        const configuredModel = this.configuredNvidiaModel();
-        const configuredInfo = nvidia_1.AVAILABLE_MODELS.find(model => model.id === configuredModel);
+    configuredGeminiOption() {
+        const configuredModel = this.configuredGeminiModel();
+        const configuredInfo = gemini_1.AVAILABLE_MODELS.find(model => model.id === configuredModel);
         return {
-            id: `${NVIDIA_MODEL_PREFIX}${configuredModel}`,
-            label: configuredInfo?.label ?? `Configured NVIDIA: ${configuredModel}`,
-            provider: 'nvidia'
+            id: `${GEMINI_MODEL_PREFIX}${configuredModel}`,
+            label: configuredInfo?.label ?? `Gemini: ${configuredModel}`,
+            provider: 'gemini'
         };
     }
-    configuredNvidiaModel() {
-        const configuredModel = cfg('nvidiaModel', nvidia_1.AVAILABLE_MODELS[0].id);
-        return NVIDIA_MODEL_IDS.has(configuredModel) ? configuredModel : nvidia_1.AVAILABLE_MODELS[0].id;
+    configuredGeminiModel() {
+        const configuredModel = cfg('geminiModel', gemini_1.AVAILABLE_MODELS[0].id);
+        return GEMINI_MODEL_IDS.has(configuredModel) ? configuredModel : gemini_1.AVAILABLE_MODELS[0].id;
     }
 }
 exports.ModelRouter = ModelRouter;

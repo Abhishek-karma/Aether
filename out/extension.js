@@ -37,18 +37,161 @@ exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const chatView_1 = require("./ui/chatView");
+const chatHistory_1 = require("./ui/chatHistory");
+const contextEngine_1 = require("./agent/contextEngine");
+const modelRouter_1 = require("./llm/modelRouter");
+const actions_1 = require("./agent/actions");
+const edit_1 = require("./tools/edit");
+const file_1 = require("./tools/file");
+const terminal_1 = require("./tools/terminal");
+const logger_1 = require("./utils/logger");
 function activate(context) {
-    console.log('Aether is now active!');
+    // Initialize shared output channel
+    const outputChannel = (0, logger_1.getOutputChannel)();
+    context.subscriptions.push(outputChannel);
+    (0, logger_1.logInfo)('Aether is now active!');
+    const chatHistory = new chatHistory_1.ChatHistoryStore(context);
+    const contextEngine = new contextEngine_1.ContextEngine();
+    // Create ONE shared model router
+    const modelRouter = new modelRouter_1.ModelRouter();
     // Register Webview Provider for the Sidebar Chat
-    const chatViewProvider = new chatView_1.ChatViewProvider(context.extensionUri, context);
-    context.subscriptions.push(vscode.window.registerWebviewViewProvider('aetherChatView', chatViewProvider));
+    const chatViewProvider = new chatView_1.ChatViewProvider(context.extensionUri, context, modelRouter);
+    context.subscriptions.push(vscode.window.registerWebviewViewProvider(chatView_1.ChatViewProvider.viewType, chatViewProvider, {
+        webviewOptions: { retainContextWhenHidden: true }
+    }));
     // Command: Start Chat
     const startChatCommand = vscode.commands.registerCommand('aether.startChat', () => {
-        vscode.commands.executeCommand('aetherChatView.focus');
+        vscode.commands.executeCommand(`${chatView_1.ChatViewProvider.viewType}.focus`);
     });
     const newTaskCommand = vscode.commands.registerCommand('aether.newTask', async () => {
-        await chatViewProvider.clearHistory();
-        await vscode.commands.executeCommand('aetherChatView.focus');
+        await chatHistory.clearActiveSession();
+        chatViewProvider.postMessage({ type: 'historyLoaded', messages: [] });
+        await vscode.commands.executeCommand(`${chatView_1.ChatViewProvider.viewType}.focus`);
+    });
+    // Command: Stop Generation
+    const stopGenerationCommand = vscode.commands.registerCommand('aether.stopGeneration', () => {
+        modelRouter.abort();
+    });
+    // Command: Send Message
+    const sendMessageCommand = vscode.commands.registerCommand('aether.sendMessage', async (text, modelId) => {
+        const history = chatHistory.activeSession.messages;
+        // Save user message
+        await chatHistory.appendMessage({ role: 'user', content: text });
+        // Prepare for streaming
+        chatViewProvider.postMessage({ type: 'startStream' });
+        try {
+            const requestMessages = await contextEngine.buildRequestMessages(text, history);
+            const selectedModel = await modelRouter.resolve(modelId);
+            let fullResponse = '';
+            const stream = modelRouter.chatStream(requestMessages, selectedModel);
+            for await (const chunk of stream) {
+                fullResponse += chunk;
+                chatViewProvider.postMessage({ type: 'streamChunk', chunk });
+            }
+            // If the response is completely empty, it was likely aborted immediately.
+            if (!fullResponse.trim()) {
+                chatViewProvider.postMessage({ type: 'endStream' });
+                return;
+            }
+            // Save assistant message
+            await chatHistory.appendMessage({ role: 'assistant', content: fullResponse });
+            chatViewProvider.postMessage({ type: 'endStream' });
+            // Detect and show actions
+            const actions = (0, actions_1.extractActions)(fullResponse);
+            for (const action of actions) {
+                if (action.type === 'create' || action.type === 'edit') {
+                    const fullPath = (0, file_1.resolveSafeFilePath)(action.file);
+                    let original = '';
+                    if (action.type === 'edit') {
+                        try {
+                            original = await (0, file_1.readFile)(fullPath);
+                        }
+                        catch { /* ignore */ }
+                    }
+                    chatViewProvider.postMessage({
+                        type: 'showActionCard',
+                        actionId: Math.random().toString(36).slice(2),
+                        actionType: action.type,
+                        file: action.file,
+                        content: action.content,
+                        original,
+                        fullPath
+                    });
+                }
+                else if (action.type === 'run_command') {
+                    chatViewProvider.postMessage({
+                        type: 'showCommandCard',
+                        actionId: Math.random().toString(36).slice(2),
+                        command: action.command,
+                        reason: action.reason || 'Requested by Aether'
+                    });
+                }
+            }
+        }
+        catch (error) {
+            (0, logger_1.logError)('Chat generation failed', error);
+            chatViewProvider.postMessage({ type: 'error', message: error.message || 'An unknown error occurred' });
+        }
+    });
+    // Command: Accept File Action
+    const acceptActionCommand = vscode.commands.registerCommand('aether.acceptAction', async (data) => {
+        const fullPath = (0, file_1.resolveSafeFilePath)(data.file);
+        let result;
+        if (data.actionType === 'create') {
+            result = await (0, file_1.createFile)(fullPath, data.content);
+        }
+        else {
+            result = await (0, edit_1.applyEdit)(fullPath, data.content);
+        }
+        chatViewProvider.postMessage({ type: 'fileActionResult', actionId: data.actionId, ok: result.ok, message: result.message });
+    });
+    // Command: Preview Action (Diff)
+    const previewActionCommand = vscode.commands.registerCommand('aether.previewAction', async (data) => {
+        await (0, edit_1.showDiff)(data.original || '', data.content, data.fullPath);
+    });
+    // Command: Accept Command
+    const acceptCommandCommand = vscode.commands.registerCommand('aether.acceptCommand', async (data) => {
+        try {
+            const result = await (0, terminal_1.runCommand)(data.command);
+            chatViewProvider.postMessage({
+                type: 'updateToolCard',
+                actionId: data.actionId,
+                status: result.exitCode === 0 ? 'done' : 'error',
+                output: result.stdout + (result.stderr ? '\n' + result.stderr : '')
+            });
+            // Removed auto-feedback loop that caused infinite LLM chatting
+            // The user can manually tell the LLM if they want to.
+            if (result.exitCode !== 0) {
+                (0, logger_1.logWarn)(`Command failed, wait for user input. Exit code: ${result.exitCode}`);
+            }
+        }
+        catch (error) {
+            chatViewProvider.postMessage({ type: 'updateToolCard', actionId: data.actionId, status: 'error', output: error.message });
+        }
+    });
+    const clearHistoryCommand = vscode.commands.registerCommand('aether.clearHistory', async () => {
+        await chatHistory.clearActiveSession();
+        chatViewProvider.postMessage({ type: 'historyLoaded', messages: [] });
+    });
+    const showHistoryCommand = vscode.commands.registerCommand('aether.showHistory', async () => {
+        const sessions = chatHistory.sessions;
+        if (sessions.length === 0) {
+            vscode.window.showInformationMessage('No chat history available.');
+            return;
+        }
+        const items = sessions.map(s => ({
+            label: new Date(s.updatedAt).toLocaleString(),
+            description: s.messages.length > 0 ? s.messages[0].content.substring(0, 50) + '...' : 'Empty Session',
+            session: s
+        }));
+        const selected = await vscode.window.showQuickPick(items, {
+            placeHolder: 'Select a previous chat session'
+        });
+        if (selected) {
+            await chatHistory.selectSession(selected.session.id);
+            chatViewProvider.postMessage({ type: 'historyLoaded', messages: selected.session.messages });
+            await vscode.commands.executeCommand(`${chatView_1.ChatViewProvider.viewType}.focus`);
+        }
     });
     // Command: Inline Chat
     const inlineChatCommand = vscode.commands.registerCommand('aether.inlineChat', async () => {
@@ -63,11 +206,13 @@ function activate(context) {
             placeHolder: 'e.g. Explain this function, Refactor to use async/await'
         });
         if (query) {
-            await vscode.commands.executeCommand('aetherChatView.focus');
+            await vscode.commands.executeCommand(`${chatView_1.ChatViewProvider.viewType}.focus`);
             await chatViewProvider.submitInlineRequest(query, selection || editor.document.getText(), vscode.workspace.asRelativePath(editor.document.uri));
         }
     });
-    context.subscriptions.push(startChatCommand, newTaskCommand, inlineChatCommand);
+    context.subscriptions.push(startChatCommand, newTaskCommand, stopGenerationCommand, sendMessageCommand, acceptActionCommand, previewActionCommand, acceptCommandCommand, clearHistoryCommand, showHistoryCommand, inlineChatCommand);
 }
-function deactivate() { }
+function deactivate() {
+    // Cleanup if needed
+}
 //# sourceMappingURL=extension.js.map

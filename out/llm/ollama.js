@@ -35,7 +35,8 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.OllamaClient = void 0;
 const vscode = __importStar(require("vscode"));
-const MODEL_LIST_TIMEOUT_MS = 1500;
+const logger_1 = require("../utils/logger");
+const MODEL_LIST_TIMEOUT_MS = 3000;
 class OllamaClient {
     get baseUrl() {
         const configured = vscode.workspace
@@ -47,7 +48,7 @@ class OllamaClient {
         return vscode.workspace.getConfiguration('aether').get('defaultModel');
     }
     /**
-     * Lists available models on the local Ollama instance
+     * Lists available models on the local Ollama instance.
      */
     async listModels() {
         const controller = new AbortController();
@@ -58,12 +59,19 @@ class OllamaClient {
                 throw new Error(`Failed to list models: ${response.statusText}`);
             }
             const data = await response.json();
-            return data.models
+            const models = data.models
                 .map(m => m.name)
                 .sort((a, b) => a.localeCompare(b));
+            (0, logger_1.logInfo)(`Ollama discovered ${models.length} local models`);
+            return models;
         }
         catch (error) {
-            console.error('Ollama Client Error (listModels):', error);
+            if (error.name === 'AbortError') {
+                (0, logger_1.logInfo)('Ollama model list timed out — server may be offline');
+            }
+            else {
+                (0, logger_1.logError)('Ollama Client Error (listModels)', error);
+            }
             return [];
         }
         finally {
@@ -71,9 +79,10 @@ class OllamaClient {
         }
     }
     /**
-     * Generates a streaming response for the chat UI
+     * Generates a streaming response for the chat UI.
+     * Supports cancellation via AbortSignal.
      */
-    async *chatStream(messages, options) {
+    async *chatStream(messages, options, signal) {
         const payload = {
             model: options.model || this.defaultModel,
             messages,
@@ -89,7 +98,8 @@ class OllamaClient {
         const response = await fetch(`${this.baseUrl}/chat`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal
         });
         if (!response.ok) {
             throw new Error(`Ollama chat failed: ${response.statusText}`);
@@ -102,16 +112,22 @@ class OllamaClient {
         let buffer = '';
         try {
             while (true) {
+                if (signal?.aborted) {
+                    (0, logger_1.logInfo)('Ollama stream aborted by user');
+                    return;
+                }
                 const { done, value } = await reader.read();
-                if (done)
+                if (done) {
                     break;
+                }
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
                 // Keep the last incomplete line in the buffer
                 buffer = lines.pop() || '';
                 for (const line of lines) {
-                    if (line.trim() === '')
+                    if (line.trim() === '') {
                         continue;
+                    }
                     try {
                         const parsed = JSON.parse(line);
                         if (parsed.message?.content) {
@@ -119,7 +135,7 @@ class OllamaClient {
                         }
                     }
                     catch (e) {
-                        console.error('Error parsing Ollama stream chunk:', e, 'Line:', line);
+                        (0, logger_1.logError)('Error parsing Ollama stream chunk', e);
                     }
                 }
             }
@@ -131,8 +147,8 @@ class OllamaClient {
                         yield parsed.message.content;
                     }
                 }
-                catch (e) {
-                    // ignore
+                catch {
+                    // ignore trailing incomplete chunk
                 }
             }
         }
@@ -141,7 +157,7 @@ class OllamaClient {
         }
     }
     /**
-     * Generates a non-streaming response for tool calls / background tasks
+     * Generates a non-streaming response for tool calls / background tasks.
      */
     async generate(prompt, options) {
         const payload = {
@@ -168,7 +184,7 @@ class OllamaClient {
         return data.response;
     }
     /**
-     * Generates embeddings for semantic search
+     * Generates embeddings for semantic search.
      */
     async generateEmbeddings(text, model = 'nomic-embed-text') {
         const response = await fetch(`${this.baseUrl}/embeddings`, {

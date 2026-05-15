@@ -40,13 +40,22 @@ exports.resolveSafeFilePath = resolveSafeFilePath;
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 const workspace_1 = require("./workspace");
+const logger_1 = require("../utils/logger");
+/**
+ * Creates a new file at the given path. If the file already exists,
+ * prompts the user to confirm overwrite instead of silently failing.
+ */
 async function createFile(filePath, content) {
     const uri = vscode.Uri.file(filePath);
     try {
         await vscode.workspace.fs.stat(uri);
-        const message = `File already exists: ${filePath}`;
-        vscode.window.showErrorMessage(message);
-        return { ok: false, message };
+        // File exists — ask user whether to overwrite
+        const choice = await vscode.window.showWarningMessage(`File already exists: ${path.basename(filePath)}. Overwrite?`, { modal: false }, 'Overwrite', 'Cancel');
+        if (choice !== 'Overwrite') {
+            const message = `Skipped existing file: ${filePath}`;
+            (0, logger_1.logInfo)(message);
+            return { ok: false, message };
+        }
     }
     catch {
         // File does not exist, safe to create
@@ -58,6 +67,7 @@ async function createFile(filePath, content) {
     const document = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(document, { preview: false });
     const message = `File created: ${filePath}`;
+    (0, logger_1.logInfo)(message);
     vscode.window.showInformationMessage(message);
     return { ok: true, message };
 }

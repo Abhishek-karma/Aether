@@ -1,8 +1,14 @@
 {
   "name": "aether",
   "displayName": "Aether",
-  "description": "AI coding assistant powered by NVIDIA NIM and local Ollama models",
+  "description": "AI coding assistant powered by Google Gemini and local Ollama models",
   "version": "0.2.0",
+  "publisher": "AetherTeam",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AetherTeam/aether.git"
+  },
+  "icon": "media/icon.svg",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -39,6 +45,18 @@
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "aether.startChat",
+        "key": "ctrl+alt+a",
+        "mac": "cmd+alt+a"
+      },
+      {
+        "command": "aether.inlineChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      }
+    ],
     "views": {
       "aether-sidebar": [
         {
@@ -51,41 +69,31 @@
     "configuration": {
       "title": "Aether",
       "properties": {
-        "aether.nvidiaApiKey": {
+        "aether.geminiApiKey": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Your **NVIDIA NIM API key**. Get one at [build.nvidia.com](https://build.nvidia.com). Stored in VS Code settings; consider using a [Settings Sync secret](https://code.visualstudio.com/docs/editor/settings-sync) for security."
+          "markdownDescription": "Your **Google Gemini API key**. Get one free at [aistudio.google.com](https://aistudio.google.com/apikey). Stored in VS Code settings; consider using a [Settings Sync secret](https://code.visualstudio.com/docs/editor/settings-sync) for security."
         },
-        "aether.nvidiaModel": {
+        "aether.geminiModel": {
           "type": "string",
-          "default": "z-ai/glm-5.1",
+          "default": "gemini-2.5-flash",
           "enum": [
-            "z-ai/glm-5.1",
-            "deepseek-ai/deepseek-r1",
-            "deepseek-ai/deepseek-v3",
-            "meta/llama-3.3-70b-instruct",
-            "meta/llama-3.1-405b-instruct",
-            "mistralai/mistral-large-2-instruct",
-            "mistralai/mixtral-8x22b-instruct-v0.1",
-            "nvidia/llama-3.1-nemotron-70b-instruct",
-            "google/gemma-3-27b-it",
-            "microsoft/phi-3-medium-128k-instruct",
-            "qwen/qwen2.5-coder-32b-instruct"
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash"
           ],
           "enumDescriptions": [
-            "Z-AI GLM 5.1 - thinking model with reasoning tokens (ZML)",
-            "DeepSeek R1 - open-source reasoning/CoT model",
-            "DeepSeek V3 - fast general-purpose model",
-            "Llama 3.3 70B Instruct - Meta's latest instruction-tuned model",
-            "Llama 3.1 405B Instruct - Meta's largest open model",
-            "Mistral Large 2 - Mistral's flagship model",
-            "Mixtral 8x22B - Mistral MoE model",
-            "Nemotron 70B - NVIDIA fine-tuned Llama for coding",
-            "Gemma 3 27B - Google's open model",
-            "Phi-3 Medium 128K - Microsoft's small-but-capable model",
-            "Qwen 2.5 Coder 32B - Alibaba's coding-specialized model"
+            "Gemini 2.5 Flash — fast thinking model with reasoning",
+            "Gemini 2.5 Pro — most capable thinking model",
+            "Gemini 2.0 Flash — balanced speed and quality",
+            "Gemini 2.0 Flash Lite — lightweight and fast",
+            "Gemini 1.5 Pro — large context window (1M tokens)",
+            "Gemini 1.5 Flash — fast with large context"
           ],
-          "description": "Configured NVIDIA NIM model shown in the chat toolbar."
+          "description": "Default Gemini model shown in the chat toolbar."
         },
         "aether.ollamaBaseUrl": {
           "type": "string",
@@ -117,10 +125,11 @@
     "vscode:prepublish": "npm run package",
     "package": "npm run compile",
     "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "npm run test-compile",
-    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node",
+    "esbuild-base": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node",
     "esbuild": "npm run esbuild-base -- --sourcemap",
     "test-compile": "tsc -p ./"
   },
@@ -136,6 +145,6 @@
   },
   "dependencies": {
     "@vscode/webview-ui-toolkit": "^1.2.2",
-    "openai": "^6.36.0"
+    "@google/genai": "^0.14.0"
   }
 }

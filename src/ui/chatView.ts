@@ -1,43 +1,31 @@
 import * as vscode from 'vscode';
-import {
-    CommandAction,
-    FileAction,
-    ReadFileAction,
-    createActiveEditorFallbackAction,
-    extractActions,
-    shouldRequireFileActions
-} from '../agent/actions';
-import { generateSystemPrompt } from '../agent/prompt';
 import { ModelRouter } from '../llm/modelRouter';
-import { applyEdit, showDiff } from '../tools/edit';
-import { createFile, fileExists, readFile, resolveSafeFilePath } from '../tools/file';
-import { runCommand } from '../tools/terminal';
-import { collectWorkspaceContext } from '../tools/workspace';
-
-type ChatMessage = { role: 'user' | 'assistant'; content: string };
-
-const HISTORY_KEY = 'aether.chatHistory';
-const MAX_STORED_MESSAGES = 100;
+import { sanitizeHtml } from '../utils/sanitize';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
+    public static readonly viewType = 'aetherChatView';
     private _view?: vscode.WebviewView;
-    private readonly modelRouter: ModelRouter;
-    private messages: ChatMessage[] = [];
-    private lastModel?: string;
-    private actionCounter = 0;
 
     constructor(
         private readonly _extensionUri: vscode.Uri,
-        private readonly extensionContext: vscode.ExtensionContext
+        private readonly _context: vscode.ExtensionContext,
+        private readonly _modelRouter: ModelRouter
     ) {
-        this.modelRouter = new ModelRouter();
-        this.messages = this.loadHistory();
+        // Listen for model-related configuration changes
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('aether.geminiModel') || 
+                e.affectsConfiguration('aether.defaultModel') ||
+                e.affectsConfiguration('aether.ollamaBaseUrl')) {
+                this._modelRouter.invalidateCache();
+                this._updateModels();
+            }
+        });
     }
 
-    public async resolveWebviewView(
+    public resolveWebviewView(
         webviewView: vscode.WebviewView,
-        _context: vscode.WebviewViewResolveContext,
-        _token: vscode.CancellationToken
+        context: vscode.WebviewViewResolveContext,
+        _token: vscode.CancellationToken,
     ) {
         this._view = webviewView;
 
@@ -47,840 +35,270 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         };
 
         webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
-        this.postHistory();
 
-        webviewView.webview.onDidReceiveMessage(async data => {
+        // Initial model population
+        this._updateModels();
+
+        webviewView.webview.onDidReceiveMessage(data => {
             switch (data.type) {
                 case 'sendMessage':
-                    await this.handleUserMessage(data.text, data.model);
+                    vscode.commands.executeCommand('aether.sendMessage', data.text, data.model);
                     break;
-                case 'clearChat':
-                    this.messages = [];
-                    await this.saveHistory();
+                case 'stopGeneration':
+                    vscode.commands.executeCommand('aether.stopGeneration');
                     break;
-                case 'getHistory':
-                    this.postHistory();
+                case 'acceptAction':
+                    vscode.commands.executeCommand('aether.acceptAction', data);
                     break;
-                case 'getModels': {
-                    const { models, defaultModel } = await this.modelRouter.listModels();
-                    this._view?.webview.postMessage({ type: 'modelsLoaded', models, defaultModel });
+                case 'previewAction':
+                    vscode.commands.executeCommand('aether.previewAction', data);
                     break;
-                }
+                case 'acceptCommand':
+                    vscode.commands.executeCommand('aether.acceptCommand', data);
+                    break;
+                case 'clearHistory':
+                    vscode.commands.executeCommand('aether.clearHistory');
+                    break;
+                case 'showHistory':
+                    vscode.commands.executeCommand('aether.showHistory');
+                    break;
                 case 'openSettings':
                     vscode.commands.executeCommand('workbench.action.openSettings', 'aether');
                     break;
-                case 'previewAction':
-                    await showDiff(data.original, data.content, data.fullPath);
-                    break;
-                case 'acceptAction':
-                    await this.executeFileAction(data.actionId, data.actionType, data.file, data.content);
-                    break;
-                case 'acceptCommand':
-                    await this.executeApprovedCommand(data.actionId, data.command, data.model);
-                    break;
             }
         });
     }
 
-    public async submitExternalMessage(text: string, model?: string) {
-        if (!this._view) {
-            await vscode.commands.executeCommand('aetherChatView.focus');
+    public postMessage(message: any) {
+        if (this._view) {
+            // Sanitize chunks before sending to webview to prevent XSS
+            if (message.type === 'streamChunk' && message.chunk) {
+                message.chunk = sanitizeHtml(message.chunk);
+            }
+            this._view.webview.postMessage(message);
         }
-
-        this._view?.webview.postMessage({ type: 'addExternalUserMessage', text });
-        await this.handleUserMessage(text, model);
-    }
-
-    public async submitInlineRequest(query: string, selectedCode: string, fileName: string) {
-        const text = `Inline request for ${fileName}:
-${query}
-
-Selected code:
-\`\`\`
-${selectedCode}
-\`\`\`
-
-If an edit is needed, return the full updated content for ${fileName}.`;
-
-        await this.submitExternalMessage(text);
     }
 
     public async clearHistory() {
-        this.messages = [];
-        await this.saveHistory();
-        this._view?.webview.postMessage({ type: 'historyLoaded', messages: [] });
+        if (this._view) {
+            this._view.webview.postMessage({ type: 'historyLoaded', messages: [] });
+        }
     }
 
-    private async handleUserMessage(text: string, model?: string) {
-        if (!this._view) {
-            return;
-        }
-
-        this.messages.push({ role: 'user', content: text });
-        await this.saveHistory();
-        await this.runAssistantTurn(text, model);
-    }
-
-    private async runAssistantTurn(contextHint: string, model?: string, isCorrectionRetry = false) {
-        if (!this._view) {
-            return;
-        }
-
-        this._view.webview.postMessage({ type: 'startStream' });
-
-        try {
-            let fullResponse = '';
-            const selectedModel = await this.modelRouter.resolve(model);
-            this.lastModel = selectedModel.value;
-            const workspaceContext = await collectWorkspaceContext(contextHint);
-            const requestMessages = [
-                {
-                    role: 'system' as const,
-                    content: generateSystemPrompt(
-                        workspaceContext.snippets,
-                        workspaceContext.workspaceRoot || 'No workspace opened'
-                    )
-                },
-                ...this.messages.slice(-12)
-            ];
-
-            const stream = this.modelRouter.chatStream(requestMessages, selectedModel);
-
-            for await (const chunk of stream) {
-                fullResponse += chunk;
-                this._view.webview.postMessage({ type: 'streamChunk', chunk });
-            }
-
-            this.messages.push({ role: 'assistant', content: fullResponse });
-            await this.saveHistory();
-            this._view.webview.postMessage({ type: 'endStream' });
-
-            const actionCount = await this.processAgentActions(fullResponse, contextHint);
-            if (actionCount === 0 && shouldRequireFileActions(contextHint) && !isCorrectionRetry) {
-                await this.retryAsAgentAction(contextHint, selectedModel.value);
-            }
-        } catch (error: unknown) {
-            this._view.webview.postMessage({
-                type: 'error',
-                message: error instanceof Error ? error.message : 'An error occurred connecting to the selected model provider'
+    public async submitInlineRequest(query: string, selection: string, path: string) {
+        if (this._view) {
+            this._view.webview.postMessage({ 
+                type: 'startStream'
             });
+            const fullPrompt = `Context from ${path}:\n\`\`\`\n${selection}\n\`\`\`\n\nQuestion: ${query}`;
+            vscode.commands.executeCommand('aether.sendMessage', fullPrompt);
         }
     }
 
-    private async continueAfterToolResult(summary: string, model?: string) {
-        this.messages.push({
-            role: 'user',
-            content: `Tool result:\n${summary}\n\nContinue based on this result.`
-        });
-        await this.saveHistory();
-        await this.runAssistantTurn(summary, model || this.lastModel);
-    }
-
-    private loadHistory(): ChatMessage[] {
-        const saved = this.extensionContext.workspaceState.get<ChatMessage[]>(HISTORY_KEY, []);
-        return saved.filter(message =>
-            (message.role === 'user' || message.role === 'assistant') &&
-            typeof message.content === 'string'
-        );
-    }
-
-    private async saveHistory() {
-        const trimmed = this.messages.slice(-MAX_STORED_MESSAGES);
-        this.messages = trimmed;
-        await this.extensionContext.workspaceState.update(HISTORY_KEY, trimmed);
-    }
-
-    private postHistory() {
-        this._view?.webview.postMessage({
-            type: 'historyLoaded',
-            messages: this.messages
-        });
-    }
-
-    private async retryAsAgentAction(originalRequest: string, model: string) {
-        const correction = `Your previous response did not contain any Aether tool actions. This is an implementation task, so do not explain or give instructions. Produce the next required create/edit/read_file/run_command action now for this user request:\n\n${originalRequest}`;
-        const actionId = this.nextActionId();
-        this._view?.webview.postMessage({
-            type: 'showToolCard',
-            actionId,
-            tool: 'Agent Correction',
-            title: 'Requesting file action',
-            status: 'running'
-        });
-        this.messages.push({ role: 'user', content: correction });
-        await this.saveHistory();
-        await this.runAssistantTurn(originalRequest, model, true);
-        this._view?.webview.postMessage({
-            type: 'updateToolCard',
-            actionId,
-            status: 'done',
-            output: 'Correction request sent.'
-        });
-    }
-
-    private async processAgentActions(response: string, contextHint: string): Promise<number> {
-        try {
-            const actions = extractActions(response);
-            if (actions.length === 0) {
-                const fallback = createActiveEditorFallbackAction(response, contextHint);
-                if (fallback) {
-                    actions.push(fallback);
-                }
-            }
-
-            for (const action of actions) {
-                if (action.type === 'read_file') {
-                    await this.executeReadFileAction(action);
-                    continue;
-                }
-
-                if (action.type === 'run_command') {
-                    this.showCommandAction(action);
-                    continue;
-                }
-
-                await this.showFileAction(action);
-            }
-
-            return actions.length;
-        } catch (error: unknown) {
-            console.error('Error processing agent actions:', error);
-            this._view?.webview.postMessage({
-                type: 'error',
-                message: error instanceof Error ? error.message : 'Could not process proposed file actions.'
-            });
-            return 0;
-        }
-    }
-
-    private async showFileAction(action: FileAction) {
-        const fullPath = resolveSafeFilePath(action.file);
-        const actionType = action.type === 'create' && await fileExists(fullPath) ? 'edit' : action.type;
-        let original = '';
-
-        if (actionType === 'edit') {
+    private async _updateModels() {
+        if (this._view) {
             try {
-                original = await readFile(fullPath);
-            } catch {
-                original = '';
+                const { models, defaultModel } = await this._modelRouter.listModels();
+                this._view.webview.postMessage({ type: 'modelsLoaded', models, defaultModel });
+            } catch (error) {
+                console.error('Failed to load models:', error);
             }
         }
-
-        this._view?.webview.postMessage({
-            type: 'showActionCard',
-            actionId: this.nextActionId(),
-            actionType,
-            file: action.file,
-            fullPath,
-            content: action.content,
-            original
-        });
-    }
-
-    private async executeFileAction(actionId: string, actionType: string, file: string, content: string) {
-        try {
-            const fullPath = resolveSafeFilePath(file);
-            const result = actionType === 'create'
-                ? await createFile(fullPath, content)
-                : await applyEdit(fullPath, content);
-
-            this._view?.webview.postMessage({
-                type: 'fileActionResult',
-                actionId,
-                ok: result.ok,
-                message: result.message
-            });
-        } catch (error: unknown) {
-            this._view?.webview.postMessage({
-                type: 'fileActionResult',
-                actionId,
-                ok: false,
-                message: error instanceof Error ? error.message : 'Could not apply file action.'
-            });
-        }
-    }
-
-    private async executeReadFileAction(action: ReadFileAction) {
-        const actionId = this.nextActionId();
-        this._view?.webview.postMessage({
-            type: 'showToolCard',
-            actionId,
-            tool: 'Read File',
-            title: action.file,
-            status: 'running'
-        });
-
-        try {
-            const fullPath = resolveSafeFilePath(action.file);
-            const content = await readFile(fullPath);
-            const summary = `Read file: ${action.file}\n\`\`\`\n${this.trimToolContent(content)}\n\`\`\``;
-
-            this._view?.webview.postMessage({
-                type: 'updateToolCard',
-                actionId,
-                status: 'done',
-                output: content
-            });
-
-            await this.continueAfterToolResult(summary);
-        } catch (error: unknown) {
-            const message = error instanceof Error ? error.message : 'Could not read file.';
-            this._view?.webview.postMessage({
-                type: 'updateToolCard',
-                actionId,
-                status: 'error',
-                output: message
-            });
-        }
-    }
-
-    private showCommandAction(action: CommandAction) {
-        this._view?.webview.postMessage({
-            type: 'showCommandCard',
-            actionId: this.nextActionId(),
-            command: action.command,
-            reason: action.reason || 'Aether wants to run this command.'
-        });
-    }
-
-    private async executeApprovedCommand(actionId: string, command: string, model?: string) {
-        this._view?.webview.postMessage({
-            type: 'updateToolCard',
-            actionId,
-            status: 'running',
-            output: ''
-        });
-
-        const result = await runCommand(command);
-        const output = [
-            result.stdout ? `stdout:\n${result.stdout}` : '',
-            result.stderr ? `stderr:\n${result.stderr}` : ''
-        ].filter(Boolean).join('\n\n') || '(no output)';
-
-        this._view?.webview.postMessage({
-            type: 'updateToolCard',
-            actionId,
-            status: result.exitCode === 0 ? 'done' : 'error',
-            output: `exit code: ${result.exitCode}\n\n${output}`
-        });
-
-        await this.continueAfterToolResult(
-            `Command: ${command}\nExit code: ${result.exitCode}\n${output}`,
-            model
-        );
-    }
-
-    private nextActionId(): string {
-        this.actionCounter += 1;
-        return `aether-action-${Date.now()}-${this.actionCounter}`;
-    }
-
-    private trimToolContent(content: string): string {
-        const maxChars = 16000;
-        if (content.length <= maxChars) {
-            return content;
-        }
-
-        return `${content.slice(0, maxChars)}\n... [truncated]`;
     }
 
     private _getHtmlForWebview(webview: vscode.Webview) {
-        const toolkitUri = webview.asWebviewUri(vscode.Uri.joinPath(
-            this._extensionUri,
-            'node_modules',
-            '@vscode',
-            'webview-ui-toolkit',
-            'dist',
-            'toolkit.min.js'
-        ));
-
-        const iconUri = webview.asWebviewUri(vscode.Uri.joinPath(
-            this._extensionUri,
-            'media',
-            'icon.svg'
-        ));
+        const nonce = getNonce();
+        
+        // Get local script URI
+        const scriptUri = webview.asWebviewUri(
+            vscode.Uri.joinPath(this._extensionUri, 'media', 'chat.js')
+        );
+        
+        // Security: Restrict resources and scripts.
+        const csp = [
+            "default-src 'none'",
+            `style-src ${webview.cspSource} 'unsafe-inline' https://cdnjs.cloudflare.com`,
+            `script-src 'nonce-${nonce}' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://unpkg.com`,
+            `font-src ${webview.cspSource} https://cdnjs.cloudflare.com`
+        ].join('; ') + ';';
 
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Aether Chat</title>
-    <script type="module" src="${toolkitUri}"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <meta http-equiv="Content-Security-Policy" content="${csp}">
+    <script nonce="${nonce}" src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github-dark.min.css">
+    <script nonce="${nonce}" src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
     <style>
-        body { padding: 10px; font-family: var(--vscode-font-family); color: var(--vscode-editor-foreground); }
-        .chat-container { display: flex; flex-direction: column; height: calc(100vh - 20px); }
-        .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
-        .toolbar vscode-dropdown { flex: 1; min-width: 0; }
-        .messages { flex-grow: 1; overflow-y: auto; margin-bottom: 10px; display: flex; flex-direction: column; gap: 8px; }
-        .message { padding: 8px; border-radius: 4px; line-height: 1.4; position: relative; }
-        .user-message { background-color: var(--vscode-button-background); color: var(--vscode-button-foreground); align-self: flex-end; max-width: 80%; }
-        .assistant-message { background-color: var(--vscode-editor-inactiveSelectionBackground); align-self: flex-start; max-width: 90%; }
-        pre {
-            background-color: var(--vscode-editor-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 6px;
-            padding: 24px 12px 12px 12px;
-            overflow-x: auto;
-            position: relative;
-            margin: 8px 0;
+        :root {
+            --background: var(--vscode-editor-background, #1e1e1e);
+            --surface: var(--vscode-sideBar-background, #252526);
+            --border: var(--vscode-panel-border, #333);
+            --text-main: var(--vscode-editor-foreground, #d4d4d4);
+            --text-muted: var(--vscode-descriptionForeground, #9d9d9d);
+            --accent: var(--vscode-button-background, #0e639c);
+            --accent-hover: var(--vscode-button-hoverBackground, #1177bb);
+            --assistant-bubble: #2a2a2a;
+            --user-bubble: #005a9e;
+            --font-family: var(--vscode-font-family, "Segoe UI", Roboto, Helvetica, Arial, sans-serif);
         }
-        pre::before {
-            content: 'CODE';
-            position: absolute;
-            top: 4px;
-            left: 8px;
-            font-size: 10px;
-            font-weight: bold;
-            opacity: 0.5;
-            letter-spacing: 1px;
+        * { box-sizing: border-box; }
+        body {
+            background-color: var(--background); color: var(--text-main);
+            font-family: var(--font-family); margin: 0; padding: 0;
+            display: flex; flex-direction: column; height: 100vh; overflow: hidden;
         }
-        code { font-family: var(--vscode-editor-font-family); font-size: 12px; }
-        .action-card {
-            background-color: var(--vscode-sideBar-background);
-            border: 1px solid var(--vscode-panel-border);
-            padding: 12px;
-            margin-top: 10px;
-            border-radius: 6px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-        .action-header { font-weight: bold; font-size: 0.9em; display: flex; align-items: center; gap: 6px; }
-        .action-file { font-family: var(--vscode-editor-font-family); font-size: 0.85em; opacity: 0.8; }
-        .action-buttons { display: flex; gap: 8px; }
-        .tool-card {
-            background-color: var(--vscode-editorWidget-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 6px;
-            padding: 10px;
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-        .tool-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-        .tool-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .tool-subtitle { color: var(--vscode-descriptionForeground); font-size: 0.85em; }
-        .tool-output {
-            background: var(--vscode-editor-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 4px;
-            color: var(--vscode-editor-foreground);
-            font-family: var(--vscode-editor-font-family);
-            font-size: 11px;
-            max-height: 240px;
-            overflow: auto;
-            padding: 8px;
-            white-space: pre-wrap;
-        }
-        .status-pill {
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 999px;
-            color: var(--vscode-descriptionForeground);
-            flex: 0 0 auto;
-            font-size: 11px;
-            padding: 2px 7px;
-        }
-        .status-running { color: var(--vscode-progressBar-background); }
-        .status-done { color: var(--vscode-testing-iconPassed); }
-        .status-error { color: var(--vscode-testing-iconFailed); }
-        .typing {
-            align-items: center;
-            display: inline-flex;
-            gap: 4px;
-            min-height: 18px;
-        }
-        .typing span {
-            animation: pulse 1s infinite ease-in-out;
-            background: var(--vscode-descriptionForeground);
-            border-radius: 50%;
-            display: inline-block;
-            height: 6px;
-            width: 6px;
-        }
-        .typing span:nth-child(2) { animation-delay: 0.15s; }
-        .typing span:nth-child(3) { animation-delay: 0.3s; }
-        .spinner {
-            animation: spin 0.8s linear infinite;
-            border: 2px solid var(--vscode-panel-border);
-            border-top-color: var(--vscode-progressBar-background);
-            border-radius: 50%;
-            height: 12px;
-            width: 12px;
-        }
-        @keyframes pulse {
-            0%, 80%, 100% { opacity: 0.35; transform: translateY(0); }
-            40% { opacity: 1; transform: translateY(-3px); }
-        }
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        .input-container { display: flex; flex-direction: column; gap: 8px; padding-bottom: 20px; }
-        .error { color: var(--vscode-errorForeground); margin-top: 5px; font-size: 0.9em; }
+        button { background:transparent; border:none; color:var(--text-main); font-family:inherit; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+        button.icon-btn { padding:4px; border-radius:4px; }
+        button.icon-btn:hover { background:rgba(255,255,255,0.1); }
+        button.primary { background:var(--accent); color:white; padding:4px 8px; border-radius:4px; }
+        button.primary:hover { background:var(--accent-hover); }
+        button.secondary { background:rgba(255,255,255,0.1); color:var(--text-main); padding:4px 8px; border-radius:4px; }
+        button.secondary:hover { background:rgba(255,255,255,0.2); }
+        select { background:var(--surface); color:var(--text-main); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-family:inherit; font-size:13px; outline:none; cursor:pointer; width:100%; }
+        select:focus { border-color:var(--accent); }
+
+        .header { height:48px; display:flex; align-items:center; justify-content:space-between; padding:0 12px; background-color:var(--surface); border-bottom:1px solid var(--border); flex-shrink:0; z-index:100; }
+        .header-left { display:flex; align-items:center; gap:8px; }
+        .header-title { font-weight:600; font-size:13px; letter-spacing:0.5px; }
+        .header-icon { color:var(--accent); display:flex; align-items:center; }
+        .header-right { display:flex; gap:4px; }
+
+        .model-container { padding:8px 12px; border-bottom:1px solid var(--border); background:var(--background); display:flex; align-items:center; gap:12px; flex-shrink:0; }
+        .model-label { font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; }
+        .model-select-wrapper { flex:1; }
+
+        #messages { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:16px; scroll-behavior:smooth; }
+
+        .message-row { display:flex; width:100%; margin-bottom:4px; }
+        .user-row { justify-content:flex-end; }
+        .assistant-row { justify-content:flex-start; }
+        .message-wrapper { max-width:85%; display:flex; flex-direction:column; gap:4px; }
+        .user-wrapper { align-items:flex-end; }
+        .assistant-wrapper { align-items:flex-start; }
+        .sender-info { font-size:11px; color:var(--text-muted); display:flex; align-items:center; gap:6px; }
+        .assistant-avatar { width:18px; height:18px; background:var(--accent); color:white; border-radius:4px; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:bold; }
+
+        .message-bubble { padding:10px 14px; border-radius:12px; font-size:13px; line-height:1.5; word-wrap:break-word; position:relative; transition:transform 0.1s ease; width:100%; }
+        .message-bubble:hover { transform:translateY(-1px); }
+        .user-bubble { background-color:var(--user-bubble); color:#ffffff; border-bottom-right-radius:2px; }
+        .assistant-bubble { background-color:var(--assistant-bubble); color:var(--text-main); border:1px solid var(--border); border-bottom-left-radius:2px; }
+
+        .tool-card { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:8px; padding:12px; margin:8px 0; width:100%; }
+        .tool-header { font-weight:600; font-size:12px; margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+        .status-pill { font-size:10px; padding:2px 8px; border-radius:10px; background:rgba(255,255,255,0.1); }
+
+        .input-area { padding:12px; background-color:var(--background); border-top:1px solid var(--border); flex-shrink:0; }
+        .input-container { background:var(--surface); border:1px solid var(--border); border-radius:24px; padding:8px 16px; display:flex; align-items:center; gap:12px; transition:border-color 0.2s ease; }
+        .input-container:focus-within { border-color:var(--accent); }
+        .input-container.disabled { opacity:0.6; }
+        .input-container.disabled #chat-input { pointer-events:none; }
+
+        #chat-input { flex:1; background:transparent; border:none; color:var(--text-main); font-family:inherit; font-size:13px; outline:none; resize:none; max-height:120px; padding:4px 0; }
+        #chat-input::placeholder { color:var(--text-muted); opacity:0.6; }
+
+        .action-buttons { display:flex; align-items:center; gap:8px; }
+        .icon-btn { cursor:pointer; color:var(--text-muted); opacity:0.7; transition:all 0.2s; display:flex; align-items:center; justify-content:center; }
+        .icon-btn:hover { color:var(--text-main); opacity:1; }
+        .send-btn { color:var(--accent); opacity:0.5; pointer-events:none; }
+        .send-btn.active { opacity:1; pointer-events:auto; }
+        .stop-btn { color:#f48771; display:none; }
+        .stop-btn.active { display:flex; }
+
+        #messages::-webkit-scrollbar { width:10px; }
+        #messages::-webkit-scrollbar-track { background:transparent; }
+        #messages::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.1); border-radius:5px; border:3px solid var(--background); }
+        #messages::-webkit-scrollbar-thumb:hover { background:rgba(255,255,255,0.2); }
+
+        pre { background:#1a1a1a !important; padding:12px; border-radius:8px; border:1px solid var(--border); overflow-x:auto; position:relative; }
+        code { font-family:var(--vscode-editor-font-family, monospace); font-size:12px; }
+        p { margin:0 0 10px 0; }
+        p:last-child { margin-bottom:0; }
+        .copy-btn { position:absolute; top:4px; right:4px; background:rgba(255,255,255,0.1); border:none; color:var(--text-muted); border-radius:4px; padding:4px; font-size:10px; cursor:pointer; }
+        .copy-btn:hover { background:rgba(255,255,255,0.2); color:var(--text-main); }
+
+        details.think-block { margin-bottom:10px; border:1px solid var(--border); border-radius:6px; padding:6px; background:rgba(0,0,0,0.1); }
+        details.think-block summary { cursor:pointer; color:var(--text-muted); font-size:11px; padding:2px 4px; outline:none; user-select:none; }
+        details.think-block .think-content { font-size:12px; color:var(--text-muted); padding:8px; margin-top:4px; white-space:pre-wrap; font-style:italic; }
+
+        .empty-state { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; color:var(--text-muted); text-align:center; gap:16px; padding:20px; }
+        .empty-state svg { width:48px; height:48px; color:var(--border); }
+        .empty-state p { font-size:13px; max-width:250px; }
+
+        .typing-dots { display:flex; gap:4px; padding:6px 0; }
+        .typing-dots span { width:6px; height:6px; background:var(--text-muted); border-radius:50%; opacity:0.4; animation:blink 1.4s infinite; }
+        .typing-dots span:nth-child(2) { animation-delay:0.2s; }
+        .typing-dots span:nth-child(3) { animation-delay:0.4s; }
+        @keyframes blink { 0%,100% { opacity:0.4; transform:scale(1); } 50% { opacity:1; transform:scale(1.1); } }
     </style>
 </head>
 <body>
-    <div class="chat-container">
-        <div class="toolbar">
-            <img src="${iconUri}" alt="Aether" style="height: 24px; width: 24px; flex-shrink:0;" />
-            <vscode-dropdown id="modelSelect" style="flex:1;min-width:0;">
-                <vscode-option>Loading models...</vscode-option>
-            </vscode-dropdown>
-            <vscode-button id="settingsBtn" appearance="icon" title="Open Aether settings" aria-label="Settings">&#9881;</vscode-button>
-            <vscode-button id="clearBtn" appearance="secondary">Clear</vscode-button>
+    <div class="header">
+        <div class="header-left">
+            <div class="header-icon">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                    <path d="M8 0a8 8 0 1 0 8 8 8 8 0 0 0-8-8zm0 14.5a6.5 6.5 0 1 1 6.5-6.5 6.5 6.5 0 0 1-6.5 6.5z"/>
+                    <circle cx="8" cy="8" r="3.5"/>
+                </svg>
+            </div>
+            <div class="header-title">Aether</div>
         </div>
-
-        <div class="messages" id="messages">
-            <div class="message assistant-message">Hello! I am Aether. How can I help you code today?</div>
-        </div>
-
-        <div class="input-container">
-            <vscode-text-area id="userInput" placeholder="Ask Aether..." rows="3" resize="vertical"></vscode-text-area>
-            <vscode-button id="sendBtn">Send</vscode-button>
+        <div class="header-right">
+            <button class="icon-btn" aria-label="History" id="history-btn" title="Chat History">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 8a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0zM8 3v5l3.15 1.88.7-1.18L9 7.25V3H8z"/></svg>
+            </button>
+            <button class="icon-btn" aria-label="New Chat" id="new-chat-btn" title="New Chat">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M8 14A6 6 0 108 2a6 6 0 000 12zm.5-9v2.5H11v1H8.5V11h-1V8.5H5v-1h2.5V5h1z"/></svg>
+            </button>
+            <button class="icon-btn" aria-label="Settings" id="settings-btn" title="Settings">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M8 13.5a5.5 5.5 0 100-11 5.5 5.5 0 000 11zM8 12a4 4 0 100-8 4 4 0 000 8zm1-5v2H7V7h2z"/></svg>
+            </button>
         </div>
     </div>
 
-    <script>
-        const vscode = acquireVsCodeApi();
-        const messagesContainer = document.getElementById('messages');
-        const userInput = document.getElementById('userInput');
-        const sendBtn = document.getElementById('sendBtn');
-        const clearBtn = document.getElementById('clearBtn');
-        const settingsBtn = document.getElementById('settingsBtn');
-        const modelSelect = document.getElementById('modelSelect');
+    <div class="model-container">
+        <span class="model-label">Model</span>
+        <div class="model-select-wrapper">
+            <select id="model-select"></select>
+        </div>
+    </div>
 
-        let currentAssistantMessage = null;
-        let isStreaming = false;
-        const toolCards = new Map();
+    <div id="messages"></div>
 
-        vscode.postMessage({ type: 'getModels' });
-        vscode.postMessage({ type: 'getHistory' });
+    <div class="input-area">
+        <div class="input-container" id="input-container">
+            <textarea id="chat-input" placeholder="Ask Aether..." rows="1"></textarea>
+            <div class="action-buttons">
+                <div id="clear-input" class="icon-btn" title="Clear input">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M8 8.707l3.646 3.647.708-.707L8.707 8l3.647-3.646-.707-.708L8 7.293 4.354 3.646l-.708.708L7.293 8l-3.647 3.646.708.708L8 8.707z"/></svg>
+                </div>
+                <div id="send-btn" class="icon-btn send-btn" title="Send message">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                    </svg>
+                </div>
+                <div id="stop-btn" class="icon-btn stop-btn" title="Stop generation">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M6 6h12v12H6z"/>
+                    </svg>
+                </div>
+            </div>
+        </div>
+    </div>
 
-        sendBtn.addEventListener('click', sendMessage);
-        settingsBtn.addEventListener('click', () => vscode.postMessage({ type: 'openSettings' }));
-        userInput.addEventListener('keydown', event => {
-            if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-                sendMessage();
-            }
-        });
-        clearBtn.addEventListener('click', () => {
-            messagesContainer.innerHTML = '<div class="message assistant-message">Chat cleared. What should we build next?</div>';
-            vscode.postMessage({ type: 'clearChat' });
-        });
-
-        function sendMessage() {
-            const text = userInput.value.trim();
-            const model = modelSelect.value;
-            if (text && !isStreaming) {
-                appendUserMessage(text);
-                userInput.value = '';
-                vscode.postMessage({ type: 'sendMessage', text, model });
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            }
-        }
-
-        function appendUserMessage(text) {
-            appendMessage('user', text);
-        }
-
-        function appendAssistantMessage(text) {
-            const msgDiv = appendMessage('assistant', '');
-            msgDiv.innerHTML = marked.parse(escapeHtml(text));
-        }
-
-        function appendMessage(role, text) {
-            const msgDiv = document.createElement('div');
-            msgDiv.className = role === 'user' ? 'message user-message' : 'message assistant-message';
-            msgDiv.textContent = text;
-            messagesContainer.appendChild(msgDiv);
-            return msgDiv;
-        }
-
-        function escapeHtml(value) {
-            return value
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
-        }
-
-        window.addEventListener('message', event => {
-            const message = event.data;
-            switch (message.type) {
-                case 'historyLoaded':
-                    if (message.messages.length > 0) {
-                        messagesContainer.innerHTML = '';
-                        message.messages.forEach(historyMessage => {
-                            if (historyMessage.role === 'user') {
-                                appendUserMessage(historyMessage.content);
-                            } else {
-                                appendAssistantMessage(historyMessage.content);
-                            }
-                        });
-                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                    }
-                    break;
-                case 'addExternalUserMessage':
-                    appendUserMessage(message.text);
-                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                    break;
-                case 'modelsLoaded':
-                    modelSelect.innerHTML = '';
-                    if (!message.models || message.models.length === 0) {
-                        const opt = document.createElement('vscode-option');
-                        opt.textContent = 'No models available';
-                        modelSelect.appendChild(opt);
-                    } else {
-                        message.models.forEach(m => {
-                            const opt = document.createElement('vscode-option');
-                            opt.value = m.id;
-                            opt.textContent = m.label;
-                            if (m.id === message.defaultModel) {
-                                opt.setAttribute('selected', 'true');
-                            }
-                            modelSelect.appendChild(opt);
-                        });
-                        // Sync the dropdown's displayed value to the default
-                        if (message.defaultModel) {
-                            modelSelect.value = message.defaultModel;
-                        }
-                    }
-                    break;
-                case 'startStream':
-                    isStreaming = true;
-                    sendBtn.disabled = true;
-                    currentAssistantMessage = document.createElement('div');
-                    currentAssistantMessage.className = 'message assistant-message';
-                    currentAssistantMessage.innerHTML = '<div class="typing" aria-label="Aether is thinking"><span></span><span></span><span></span></div>';
-                    messagesContainer.appendChild(currentAssistantMessage);
-                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                    break;
-                case 'streamChunk':
-                    if (currentAssistantMessage) {
-                        currentAssistantMessage.setAttribute('data-raw', (currentAssistantMessage.getAttribute('data-raw') || '') + message.chunk);
-                        currentAssistantMessage.innerHTML = marked.parse(escapeHtml(currentAssistantMessage.getAttribute('data-raw')));
-                        messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                    }
-                    break;
-                case 'endStream':
-                    isStreaming = false;
-                    sendBtn.disabled = false;
-                    currentAssistantMessage = null;
-                    break;
-                case 'showActionCard':
-                    showActionCard(message);
-                    break;
-                case 'showToolCard':
-                    showToolCard(message);
-                    break;
-                case 'showCommandCard':
-                    showCommandCard(message);
-                    break;
-                case 'updateToolCard':
-                    updateToolCard(message);
-                    break;
-                case 'fileActionResult':
-                    updateFileActionCard(message);
-                    break;
-                case 'error':
-                    isStreaming = false;
-                    sendBtn.disabled = false;
-                    appendError(message.message);
-                    break;
-            }
-        });
-
-        function showActionCard(message) {
-            const card = document.createElement('div');
-            card.className = 'action-card';
-            card.dataset.actionId = message.actionId;
-
-            const header = document.createElement('div');
-            header.className = 'action-header';
-            header.textContent = message.actionType === 'create' ? 'Create File' : 'Edit File';
-
-            const file = document.createElement('div');
-            file.className = 'action-file';
-            file.textContent = message.file;
-
-            const buttons = document.createElement('div');
-            buttons.className = 'action-buttons';
-            buttons.innerHTML =
-                '<vscode-button appearance="primary" class="preview-btn">Preview</vscode-button>' +
-                '<vscode-button appearance="primary" class="accept-btn">Accept</vscode-button>' +
-                '<vscode-button appearance="secondary" class="reject-btn">Reject</vscode-button>';
-
-            card.appendChild(header);
-            card.appendChild(file);
-            card.appendChild(buttons);
-            messagesContainer.appendChild(card);
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-
-            const previewBtn = card.querySelector('.preview-btn');
-            const acceptBtn = card.querySelector('.accept-btn');
-            const rejectBtn = card.querySelector('.reject-btn');
-
-            previewBtn.onclick = () => {
-                vscode.postMessage({
-                    type: 'previewAction',
-                    original: message.original,
-                    content: message.content,
-                    fullPath: message.fullPath
-                });
-            };
-
-            acceptBtn.onclick = () => {
-                header.textContent = 'Applying...';
-                acceptBtn.disabled = true;
-                rejectBtn.disabled = true;
-                vscode.postMessage({
-                    type: 'acceptAction',
-                    actionId: message.actionId,
-                    actionType: message.actionType,
-                    file: message.file,
-                    content: message.content
-                });
-            };
-
-            rejectBtn.onclick = () => {
-                card.remove();
-            };
-        }
-
-        function updateFileActionCard(message) {
-            const card = document.querySelector('[data-action-id="' + message.actionId + '"]');
-            if (!card) {
-                return;
-            }
-
-            const header = card.querySelector('.action-header');
-            const acceptBtn = card.querySelector('.accept-btn');
-            const rejectBtn = card.querySelector('.reject-btn');
-
-            if (message.ok) {
-                card.style.opacity = '0.65';
-                card.style.pointerEvents = 'none';
-                header.textContent = 'Applied';
-                return;
-            }
-
-            header.textContent = 'Apply failed';
-            acceptBtn.disabled = false;
-            rejectBtn.disabled = false;
-            appendError(message.message);
-        }
-
-        function showToolCard(message) {
-            const card = createToolCard(message.actionId, message.tool, message.title, message.status);
-            toolCards.set(message.actionId, card);
-            messagesContainer.appendChild(card.root);
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        }
-
-        function showCommandCard(message) {
-            const card = createToolCard(message.actionId, 'Terminal Command', message.command, 'pending');
-            card.subtitle.textContent = message.reason;
-
-            const buttons = document.createElement('div');
-            buttons.className = 'action-buttons';
-            buttons.innerHTML =
-                '<vscode-button appearance="primary" class="accept-command-btn">Run</vscode-button>' +
-                '<vscode-button appearance="secondary" class="reject-command-btn">Skip</vscode-button>';
-            card.root.appendChild(buttons);
-
-            card.root.querySelector('.accept-command-btn').onclick = () => {
-                buttons.remove();
-                updateToolCard({ actionId: message.actionId, status: 'running', output: '' });
-                vscode.postMessage({
-                    type: 'acceptCommand',
-                    actionId: message.actionId,
-                    command: message.command,
-                    model: modelSelect.value
-                });
-            };
-
-            card.root.querySelector('.reject-command-btn').onclick = () => {
-                updateToolCard({ actionId: message.actionId, status: 'error', output: 'Skipped by user.' });
-                buttons.remove();
-            };
-
-            toolCards.set(message.actionId, card);
-            messagesContainer.appendChild(card.root);
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        }
-
-        function createToolCard(actionId, tool, title, status) {
-            const root = document.createElement('div');
-            root.className = 'tool-card';
-            root.dataset.actionId = actionId;
-
-            const row = document.createElement('div');
-            row.className = 'tool-row';
-
-            const titleWrap = document.createElement('div');
-            titleWrap.style.minWidth = '0';
-
-            const heading = document.createElement('div');
-            heading.className = 'tool-title';
-            heading.textContent = tool + ': ' + title;
-
-            const subtitle = document.createElement('div');
-            subtitle.className = 'tool-subtitle';
-            subtitle.textContent = '';
-
-            const statusPill = document.createElement('div');
-            statusPill.className = 'status-pill';
-
-            titleWrap.appendChild(heading);
-            titleWrap.appendChild(subtitle);
-            row.appendChild(titleWrap);
-            row.appendChild(statusPill);
-            root.appendChild(row);
-
-            const output = document.createElement('div');
-            output.className = 'tool-output';
-            output.style.display = 'none';
-            root.appendChild(output);
-
-            const card = { root, statusPill, output, subtitle };
-            setToolStatus(card, status);
-            return card;
-        }
-
-        function updateToolCard(message) {
-            const card = toolCards.get(message.actionId);
-            if (!card) {
-                return;
-            }
-
-            setToolStatus(card, message.status);
-            if (typeof message.output === 'string' && message.output.length > 0) {
-                card.output.textContent = message.output;
-                card.output.style.display = 'block';
-            }
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        }
-
-        function setToolStatus(card, status) {
-            card.statusPill.className = 'status-pill status-' + status;
-            if (status === 'running') {
-                card.statusPill.innerHTML = '<span class="spinner"></span>';
-                card.statusPill.style.border = '0';
-            } else {
-                card.statusPill.style.border = '';
-                card.statusPill.textContent = status === 'done' ? 'Done' : status === 'error' ? 'Needs attention' : 'Awaiting approval';
-            }
-        }
-
-        function appendError(text) {
-            const errorDiv = document.createElement('div');
-            errorDiv.className = 'error';
-            errorDiv.textContent = text;
-            messagesContainer.appendChild(errorDiv);
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
-        }
-    </script>
+    <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
     }
+}
+
+function getNonce() {
+    let text = '';
+    const possible = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    for (let i = 0; i < 32; i++) {
+        text += possible.charAt(Math.floor(Math.random() * possible.length));
+    }
+    return text;
 }

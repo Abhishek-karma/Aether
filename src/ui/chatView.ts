@@ -36,7 +36,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 sendMessage: 'aether.sendMessage',
                 stopGeneration: 'aether.stopGeneration',
                 clearHistory: 'aether.clearHistory',
-                showHistory: 'aether.showHistory',
+                getHistoryList: 'aether.getHistoryList',
+                loadSession: 'aether.loadSession',
                 toggleAutoApprove: 'aether.toggleAutoApprove',
             };
             if (data.type === 'sendMessage') {
@@ -45,6 +46,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 vscode.commands.executeCommand('workbench.action.openSettings', 'aether');
             } else if (data.type === 'acceptAction' || data.type === 'previewAction' || data.type === 'acceptCommand') {
                 vscode.commands.executeCommand('aether.' + data.type.replace('accept', 'accept').replace('preview', 'preview'), data);
+            } else if (data.type === 'loadSession') {
+                vscode.commands.executeCommand('aether.loadSession', data.sessionId);
             } else if (cmdMap[data.type]) {
                 vscode.commands.executeCommand(cmdMap[data.type]);
             }
@@ -447,6 +450,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             font-size: 12px; color: var(--text-secondary); font-style: italic;
             animation: fadeIn 0.3s ease;
         }
+
+        /* ── History Panel ── */
+        .history-panel {
+            position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+            background: var(--bg); z-index: 100;
+            transform: translateX(100%); transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex; flex-direction: column;
+        }
+        .history-panel.open { transform: translateX(0); }
+        
+        .history-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 12px 16px; border-bottom: 1px solid var(--border);
+            font-weight: 600; color: var(--text); font-size: 13px;
+        }
+        .close-history-btn {
+            background: transparent; border: none; color: var(--text-secondary);
+            cursor: pointer; padding: 4px; border-radius: 4px; display: flex;
+        }
+        .close-history-btn:hover { background: rgba(255,255,255,0.08); color: var(--text); }
+        
+        .history-list {
+            flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 4px;
+        }
+        .history-item {
+            padding: 12px; border-radius: 8px; cursor: pointer;
+            border: 1px solid transparent; transition: all 0.15s;
+            display: flex; flex-direction: column; gap: 4px;
+        }
+        .history-item:hover {
+            background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.06);
+        }
+        .history-item.active {
+            background: rgba(79,195,247,0.08); border-color: rgba(79,195,247,0.2);
+        }
+        .history-title { font-size: 13px; font-weight: 500; color: var(--text); line-height: 1.3; }
+        .history-meta { font-size: 11px; color: var(--text-secondary); display: flex; justify-content: space-between; }
     </style>
 </head>
 <body>
@@ -493,6 +533,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 </button>
             </div>
         </div>
+    </div>
+
+    <!-- History Overlay -->
+    <div class="history-panel" id="history-panel">
+        <div class="history-header">
+            <span>Chat History</span>
+            <button class="close-history-btn" id="close-history" title="Close">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M12.2 4.5l-.7-.7-3.5 3.5-3.5-3.5-.7.7 3.5 3.5-3.5 3.5.7.7 3.5-3.5 3.5 3.5.7-.7-3.5-3.5z"/></svg>
+            </button>
+        </div>
+        <div class="history-list" id="history-list"></div>
     </div>
 
     <script nonce="${nonce}" src="${scriptUri}"></script>

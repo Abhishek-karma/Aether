@@ -12,6 +12,10 @@
     var settingsBtn = document.getElementById('settings-btn');
     var autoApproveBtn = document.getElementById('auto-approve-btn');
     var inputWrap = document.getElementById('input-container');
+    
+    var historyPanel = document.getElementById('history-panel');
+    var closeHistoryBtn = document.getElementById('close-history');
+    var historyList = document.getElementById('history-list');
 
     var isStreaming = false, autoApprove = false;
     var curMsg = null, parseTimer = null;
@@ -122,8 +126,16 @@
     clearBtn.onclick = function () { chatInput.value = ''; chatInput.style.height = 'auto'; sendBtn.classList.remove('active'); chatInput.focus(); };
     sendBtn.onclick = send;
     stopBtn.onclick = function () { vscode.postMessage({ type: 'stopGeneration' }); };
-    newChatBtn.onclick = function () { vscode.postMessage({ type: 'clearHistory' }); };
-    historyBtn.onclick = function () { vscode.postMessage({ type: 'showHistory' }); };
+    newChatBtn.onclick = function () { 
+        vscode.postMessage({ type: 'clearHistory' }); 
+        historyPanel.classList.remove('open');
+    };
+    historyBtn.onclick = function () { 
+        vscode.postMessage({ type: 'getHistoryList' }); 
+    };
+    closeHistoryBtn.onclick = function() {
+        historyPanel.classList.remove('open');
+    };
     settingsBtn.onclick = function () { vscode.postMessage({ type: 'openSettings' }); };
     autoApproveBtn.onclick = function () { vscode.postMessage({ type: 'toggleAutoApprove' }); };
 
@@ -192,6 +204,35 @@
         var m = ev.data;
         switch (m.type) {
             case 'autoApproveChanged': autoApprove = m.enabled; updateAutoUI(); break;
+            case 'historyListLoaded':
+                historyList.innerHTML = '';
+                if (!m.sessions || m.sessions.length === 0) {
+                    historyList.innerHTML = '<div style="padding:12px;color:var(--text-secondary);text-align:center;font-size:12px;">No chat history</div>';
+                } else {
+                    m.sessions.forEach(function(s) {
+                        var div = document.createElement('div');
+                        div.className = 'history-item' + (s.id === m.activeId ? ' active' : '');
+                        var d = new Date(s.updatedAt);
+                        
+                        var snippet = 'Empty Session';
+                        if (s.messages && s.messages.length > 0) {
+                            snippet = s.messages[0].content.substring(0, 60).replace(/\n/g, ' ');
+                            if (s.messages[0].content.length > 60) snippet += '...';
+                        }
+                        
+                        div.innerHTML = 
+                            '<div class="history-title">' + esc(s.title || 'New chat') + '</div>' +
+                            '<div class="history-meta"><span>' + esc(snippet) + '</span><span>' + d.toLocaleDateString() + '</span></div>';
+                        
+                        div.onclick = function() {
+                            vscode.postMessage({ type: 'loadSession', sessionId: s.id });
+                            historyPanel.classList.remove('open');
+                        };
+                        historyList.appendChild(div);
+                    });
+                }
+                historyPanel.classList.add('open');
+                break;
             case 'historyLoaded':
                 messages.innerHTML = '';
                 if (m.messages && m.messages.length > 0) {

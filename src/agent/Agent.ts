@@ -47,7 +47,10 @@ export class Agent {
                         this.chatViewProvider.postMessage({ type: 'streamChunk', chunk });
                     }
                 } catch (streamError: any) {
-                    if (streamError.name === 'AbortError') return;
+                    if (streamError.name === 'AbortError') {
+                        this.chatViewProvider.postMessage({ type: 'endStream' });
+                        return;
+                    }
                     throw streamError;
                 }
 

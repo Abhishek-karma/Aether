@@ -102,7 +102,9 @@ export class GeminiClient {
             for await (const chunk of stream) {
                 if (signal?.aborted) {
                     logInfo('Gemini stream aborted by user');
-                    return;
+                    const err = new Error('Aborted');
+                    err.name = 'AbortError';
+                    throw err;
                 }
 
                 // Handle thinking model output
@@ -122,7 +124,9 @@ export class GeminiClient {
         } catch (error: any) {
             if (signal?.aborted) {
                 logInfo('Gemini request aborted');
-                return;
+                const err = new Error('Aborted');
+                err.name = 'AbortError';
+                throw err;
             }
             logError('Gemini stream error', error);
             throw error;

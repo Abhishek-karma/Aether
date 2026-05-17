@@ -114,7 +114,9 @@ class OllamaClient {
             while (true) {
                 if (signal?.aborted) {
                     (0, logger_1.logInfo)('Ollama stream aborted by user');
-                    return;
+                    const err = new Error('Aborted');
+                    err.name = 'AbortError';
+                    throw err;
                 }
                 const { done, value } = await reader.read();
                 if (done) {

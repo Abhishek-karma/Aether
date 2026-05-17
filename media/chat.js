@@ -308,6 +308,15 @@
             case 'error':
                 setStreaming(false);
                 removeWritingIndicator();
+                if (curMsg) {
+                    var body = curMsg.querySelector('.bot-body');
+                    if (body && body.querySelector('.typing-dots')) {
+                        curMsg.remove(); // Remove the stuck loading bubble
+                    } else if (body && body.dataset.raw && !stripToolBlocks(body.dataset.raw).trim()) {
+                        curMsg.remove();
+                    }
+                    curMsg = null;
+                }
                 var e = document.createElement('div'); e.className = 'msg';
                 e.innerHTML = '<div class="msg-body bot-body" style="color:var(--red);border-color:rgba(244,135,113,0.3);">' + esc(m.message) + '</div>';
                 messages.appendChild(e); scroll();

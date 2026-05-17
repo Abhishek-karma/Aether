@@ -3,7 +3,7 @@ import { ChatViewProvider } from './ui/chatView';
 import { ChatHistoryStore } from './ui/chatHistory';
 import { ContextEngine } from './agent/contextEngine';
 import { ModelRouter } from './llm/modelRouter';
-import { extractActions } from './agent/actions';
+import { extractActions, shouldRequireFileActions } from './agent/actions';
 import { applyEdit, showDiff } from './tools/edit';
 import { createFile, resolveSafeFilePath, readFile } from './tools/file';
 import { runCommand } from './tools/terminal';
@@ -65,32 +65,71 @@ export function activate(context: vscode.ExtensionContext) {
         // Prepare for streaming
         chatViewProvider.postMessage({ type: 'startStream' });
 
+        const MAX_CONTINUATION_RETRIES = 2;
+        const NUDGE_MESSAGE = 'You did not emit any tool action blocks in your last response. You MUST respond with ```aether-create or ```aether-edit fenced blocks containing the full file contents. Do it now — emit ALL the file actions needed to complete the task. No more explanations.';
+
         try {
-            const requestMessages = await contextEngine.buildRequestMessages(text, history);
             const selectedModel = await modelRouter.resolve(modelId);
-            
-            let fullResponse = '';
-            const stream = modelRouter.chatStream(requestMessages, selectedModel);
+            let retryCount = 0;
+            let allActions: ReturnType<typeof extractActions> = [];
 
-            for await (const chunk of stream) {
-                fullResponse += chunk;
-                chatViewProvider.postMessage({ type: 'streamChunk', chunk });
+            // Agentic loop: stream -> extract actions -> retry if no actions found
+            while (retryCount <= MAX_CONTINUATION_RETRIES) {
+                const currentHistory = chatHistory.activeSession.messages;
+                const requestMessages = await contextEngine.buildRequestMessages(
+                    retryCount === 0 ? text : NUDGE_MESSAGE,
+                    currentHistory.slice(0, -1) // exclude the nudge itself from duplication
+                );
+
+                let fullResponse = '';
+                const stream = modelRouter.chatStream(requestMessages, selectedModel);
+
+                for await (const chunk of stream) {
+                    fullResponse += chunk;
+                    chatViewProvider.postMessage({ type: 'streamChunk', chunk });
+                }
+
+                // If the response is completely empty, it was likely aborted immediately.
+                if (!fullResponse.trim()) {
+                    chatViewProvider.postMessage({ type: 'endStream' });
+                    return;
+                }
+
+                // Save assistant message
+                await chatHistory.appendMessage({ role: 'assistant', content: fullResponse });
+
+                // Detect actions from this response
+                const actions = extractActions(fullResponse);
+                allActions.push(...actions);
+
+                if (actions.length > 0) {
+                    // We got actions — break out of the retry loop
+                    break;
+                }
+
+                // No actions found — check if the request even needed actions
+                if (!shouldRequireFileActions(text)) {
+                    // Pure question/explanation — no retry needed
+                    break;
+                }
+
+                // Actions were expected but not found — auto-continue
+                retryCount++;
+                if (retryCount <= MAX_CONTINUATION_RETRIES) {
+                    logWarn(`No actions found in response, auto-continuing (attempt ${retryCount}/${MAX_CONTINUATION_RETRIES})`);
+                    
+                    // Show a subtle indicator in chat that we're nudging the model
+                    chatViewProvider.postMessage({ type: 'streamChunk', chunk: '\n\n---\n*Generating code...*\n\n' });
+                    
+                    // Save the nudge as a user message in history so the model sees it
+                    await chatHistory.appendMessage({ role: 'user', content: NUDGE_MESSAGE });
+                }
             }
 
-            // If the response is completely empty, it was likely aborted immediately.
-            if (!fullResponse.trim()) {
-                chatViewProvider.postMessage({ type: 'endStream' });
-                return;
-            }
-
-            // Save assistant message
-            await chatHistory.appendMessage({ role: 'assistant', content: fullResponse });
             chatViewProvider.postMessage({ type: 'endStream' });
 
-            // Detect and process actions
-            const actions = extractActions(fullResponse);
-            
-            for (const action of actions) {
+            // Process all collected actions
+            for (const action of allActions) {
                 if (action.type === 'create' || action.type === 'edit') {
                     const fullPath = resolveSafeFilePath(action.file);
 
